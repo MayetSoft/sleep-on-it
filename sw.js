@@ -1,5 +1,5 @@
 // Offline cache for the whole suite. Bump CACHE whenever any file changes.
-const CACHE = "sleep-on-it-v1";
+const CACHE = "sleep-on-it-v2";
 const FILES = [
   "./",
   "index.html",
@@ -9,6 +9,8 @@ const FILES = [
   "games/ants/",
   "games/ants/index.html",
   "games/ants/icon.png",
+  "games/ants/pictures/base.js",
+  "games/ants/pictures/set-01.js",
 ];
 
 self.addEventListener("install", e => {
