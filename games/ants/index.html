@@ -261,9 +261,15 @@ function playable(img, cols) {
 }
 
 function newLevel(n) {
-  level = n; levelSeed = seedFor(n); seed = levelSeed;
+  level = n;
   lvlLabel.textContent = n + " / " + TOTAL;
-  const img = makeImage(LEVELS[n - 1]);
+  buildLevel(LEVELS[n - 1], seedFor(n));
+}
+
+// builds a level from a picture spec { pic, mirror } and a seed (also handy for testing pictures)
+function buildLevel(spec, s) {
+  levelSeed = s; seed = levelSeed;
+  const img = makeImage(spec);
   layout();
   cells = img;
   rank = new Float32Array(G * G).map(() => rnd());
