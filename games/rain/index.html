@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#070c17">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Rain on the window</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #070c17; overflow: hidden;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; }
+  button { font: 15px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em;
+    color: #e6ecf8; background: #13203a; border: 1px solid #4a5f8f; border-radius: 6px;
+    width: 104px; padding: 14px 0; cursor: pointer; }
+  button:active { background: #0d172b; }
+  button:focus-visible { outline: 2px solid #e6ecf8; outline-offset: 3px; }
+  #home { position: fixed; top: env(safe-area-inset-top); left: 4px; padding: 14px 10px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #9fb0d2; text-decoration: none; }
+  #home:focus-visible { outline: 2px solid #e6ecf8; outline-offset: 0; }
+  #bar { position: fixed; top: env(safe-area-inset-top); display: flex; align-items: center; gap: 12px; height: 44px; }
+  #lvl { font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .08em; color: #b4c2e0; }
+  #speed { width: auto; min-width: 52px; height: 44px; padding: 0 12px; font-size: 13px; color: #c8d3ec; }
+  #hint { position: fixed; left: 0; right: 0; padding: 0 20px; text-align: center;
+    font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .03em; color: #b4c2e0; }
+  #end { position: fixed; left: 0; right: 0; display: flex; justify-content: center; }
+  #probe { position: fixed; top: 0; height: env(safe-area-inset-top); width: 1px; visibility: hidden; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="bar"><div id="lvl"></div><button id="speed">1×</button></div>
+<div id="hint" class="hidden">draw on the glass to gather rain into a drop that fills the ring</div>
+<div id="end" class="hidden"><button id="next">next</button></div>
+<div id="probe"></div>
+<script>
+"use strict";
+// ---------- settings ----------
+const GW = 100, GH = 170;          // the glass, in glass units (fixed, so a level plays the same on every screen)
+const DT = 1 / 30;                 // one simulation step, in seconds
+const TOTAL = 200;
+const BIG = 12;                    // drops this heavy run down the glass on their own
+const WIDE = 1.8;                  // half width of a drawn streak
+const LIFE = 45, FADE = 8;         // a streak stays wet LIFE seconds and dries over the last FADE
+const GAP = 1.6;                   // spacing of the points along a streak
+const PREWARM = 600;               // steps of rain before a level starts
+const LIMIT = 240;                 // the patient player must finish within this many seconds of rain
+const CELL = 2.5, WX = Math.ceil(GW / CELL), WY = Math.ceil(GH / CELL);
+const rad = m => 1.15 * Math.sqrt(m);             // drop radius from its amount of water
+const runSpeed = m => 3 + 1.2 * Math.sqrt(m);      // heavy drops on bare glass
+const slideSpeed = m => 6 + 1.2 * Math.sqrt(m);    // any drop along a wet streak
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const endBox = document.getElementById("end");
+const nextBtn = document.getElementById("next");
+const speedBtn = document.getElementById("speed");
+const lvlLabel = document.getElementById("lvl");
+const bar = document.getElementById("bar");
+const hint = document.getElementById("hint");
+const SPEEDS = [1, 2, 3, 5];
+let speedIdx = 0;
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// ---------- seeded random ----------
+function rng(s) { // mulberry32
+  return () => {
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const frac = n => (Math.imul(n, 0x9E3779B1) >>> 0) / 4294967296;
+
+// ---------- numbered levels: level n always builds the same puzzle ----------
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+const saved = {                  // progress, kept in this browser only
+  get() { try { return parseInt(localStorage.getItem("rain.level"), 10) || 1; } catch (e) { return 1; } },
+  set(n) { try { localStorage.setItem("rain.level", String(n)); } catch (e) {} },
+};
+
+// more rings, bigger drops and lighter rain as levels go on; every 5th level is a harder one
+function specFor(n) {
+  const r = rng(seedFor(n)), p = (n - 1) / (TOTAL - 1), hard = n % 5 === 0;
+  let count = n <= 8 ? 1 : n <= 45 ? 2 : n <= 130 ? 3 : 4;
+  if (hard && n > 8 && count < 4) count++;
+  const base = 8 + 7 * p + (hard ? 2.5 : 0);
+  const slot = (GW - 16) / count, notches = [];
+  for (let i = 0; i < count; i++)
+    notches.push({ x: 8 + slot * (i + 0.5) + (r() - 0.5) * slot * 0.3, need: Math.max(4, Math.round(base + (r() - 0.5) * 4)) });
+  return { n, seed: seedFor(n) ^ 0x2545f491, rain: (2.6 - 0.7 * p) * (hard ? 0.9 : 1), initial: 70,
+    maxLen: Math.round(48 - 10 * p), notches };
+}
+
+// ---------- the world: rain, drops, streaks; deterministic for a spec and the same input ----------
+function makeWorld(spec) {
+  const w = { spec, t: 0, rand: rng(spec.seed), drops: [], streaks: [], trails: [], wet: new Float32Array(WX * WY),
+    rainAcc: 0, nextId: 1, ver: 0, warm: true, ready: true, readyAt: -9, won: false, wonAt: 0,
+    notches: spec.notches.map(n => ({ x: n.x, need: n.need, half: Math.max(3.5, rad(n.need) + 1), filled: false, at: 0, small: null })) };
+  for (let i = 0; i < spec.initial; i++) addDrop(w, 1 + w.rand() * (GW - 2), 1 + w.rand() * (GH - 6), w.rand() < 0.3 ? 2 : 1, true);
+  for (let i = 0; i < PREWARM; i++) step(w);
+  w.warm = false; w.t = 0;
+  for (const tr of w.trails) tr.age = LIFE;     // start with dry glass trails
+  return w;
+}
+
+function evapLife(d) { return d.m < 4 ? (14 + 22 * frac(d.id)) * d.m : Infinity; }
+function addDrop(w, x, y, m, grown) {
+  const d = { id: w.nextId++, x, y, m, r: rad(m), on: null, run: false, dead: false, age: grown ? 1 : 0,
+    chk: -1, ph: w.rand() * 6.283, fr: 0.5 + w.rand() * 0.7, amp: 0.12 + w.rand() * 0.16, trail: null };
+  d.ev = evapLife(d);
+  w.drops.push(d);
+  return d;
+}
+
+// ---------- streaks: water runs along them to their lower end ----------
+function newStreak(w, x, y) {
+  x = clamp(x, 0.5, GW - 0.5); y = clamp(y, 0.5, GH);
+  const s = { id: w.nextId++, pts: [[x, y]], cum: [0], len: 0, age: 0, down: 1, box: [x, y, x, y], dead: false };
+  w.streaks.push(s); w.ver++;
+  return s;
+}
+function extend(w, s, x, y) {
+  x = clamp(x, 0.5, GW - 0.5); y = clamp(y, 0.5, GH);
+  const P = s.pts, [lx, ly] = P[P.length - 1];
+  let d = Math.hypot(x - lx, y - ly);
+  if (d < GAP) return;
+  const room = w.spec.maxLen - s.len;
+  if (room < 0.5) return;
+  if (d > room) { x = lx + (x - lx) * room / d; y = ly + (y - ly) * room / d; d = room; }
+  P.push([x, y]); s.len += d; s.cum.push(s.len); w.ver++;
+  s.box[0] = Math.min(s.box[0], x); s.box[1] = Math.min(s.box[1], y);
+  s.box[2] = Math.max(s.box[2], x); s.box[3] = Math.max(s.box[3], y);
+  s.down = P[P.length - 1][1] >= P[0][1] ? 1 : -1;
+}
+function finish(w, s) { if (s.len < 1.5) { s.dead = true; w.streaks = w.streaks.filter(q => q !== s); } }
+function line(w, x0, y0, x1, y1) {   // a straight streak, as the patient player draws it
+  const s = newStreak(w, x0, y0), n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 3));
+  for (let i = 1; i <= n; i++) extend(w, s, x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n);
+  finish(w, s);
+  return s;
+}
+
+let PJd = 0, PJs = 0, PX = 0, PY = 0;   // scratch results
+function project(s, x, y) {
+  const P = s.pts;
+  let best = 1e9, bs = 0;
+  if (P.length === 1) { PJd = Math.hypot(x - P[0][0], y - P[0][1]); PJs = 0; return; }
+  for (let i = 0; i < P.length - 1; i++) {
+    const ax = P[i][0], ay = P[i][1], dx = P[i + 1][0] - ax, dy = P[i + 1][1] - ay, L2 = dx * dx + dy * dy;
+    let t = L2 > 0 ? ((x - ax) * dx + (y - ay) * dy) / L2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const ex = ax + dx * t - x, ey = ay + dy * t - y, d = ex * ex + ey * ey;
+    if (d < best) { best = d; bs = s.cum[i] + t * (s.cum[i + 1] - s.cum[i]); }
+  }
+  PJd = Math.sqrt(best); PJs = bs;
+}
+function pointAt(s, pos) {
+  const P = s.pts, c = s.cum;
+  if (P.length === 1) { PX = P[0][0]; PY = P[0][1]; return; }
+  let i = 0;
+  while (i < P.length - 2 && c[i + 1] < pos) i++;
+  const seg = c[i + 1] - c[i], t = seg > 0 ? clamp((pos - c[i]) / seg, 0, 1) : 0;
+  PX = P[i][0] + (P[i + 1][0] - P[i][0]) * t; PY = P[i][1] + (P[i + 1][1] - P[i][1]) * t;
+}
+const remaining = (s, pos) => s.down > 0 ? s.len - pos : pos;
+const lowEnd = s => s.down > 0 ? s.len : 0;
+const near = (s, x, y, reach) => x > s.box[0] - reach && x < s.box[2] + reach && y > s.box[1] - reach && y < s.box[3] + reach;
+
+// ---------- wet glass: heavy drops leave a trail that later drops lean towards ----------
+function wetAt(x, y) {
+  const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL);
+  return cx < 0 || cy < 0 || cx >= WX || cy >= WY ? 0 : w_wet[cy * WX + cx];
+}
+let w_wet = null;
+
+function moveToward(d, tx, ty, step) {
+  const dx = tx - d.x, dy = ty - d.y, l = Math.hypot(dx, dy);
+  if (l <= step) { d.x = tx; d.y = ty; } else { d.x += dx / l * step; d.y += dy / l * step; }
+}
+
+// ---------- one step of the world ----------
+function step(w) {
+  w_wet = w.wet;
+  w.t += DT;
+  // rain: the same drops fall in the same places whatever the player does
+  w.rainAcc += w.spec.rain * DT;
+  while (w.rainAcc >= 1) {
+    w.rainAcc -= 1;
+    addDrop(w, 1 + w.rand() * (GW - 2), 1 + w.rand() * (GH - 5), w.rand() < 0.15 ? 2 : 1, false);
+  }
+  // streaks dry out
+  for (const s of w.streaks) { s.age += DT; if (s.age > LIFE) s.dead = true; }
+  if (w.streaks.some(s => s.dead)) w.streaks = w.streaks.filter(s => !s.dead);
+
+  for (const d of w.drops) {
+    if (d.dead) continue;
+    d.age += DT;
+    const reach = WIDE + d.r * 0.6;
+    let cur = null, curS = 0, atEnd = false;
+    if (d.on && !d.on.dead) {                   // keep following the same streak while it carries the drop
+      project(d.on, d.x, d.y);
+      if (PJd <= reach) { cur = d.on; curS = PJs; atEnd = remaining(cur, PJs) < 0.3; }
+    }
+    if ((!cur || atEnd) && !(!d.on && !d.run && d.chk === w.ver)) {   // look for a streak that can carry the drop further (resting drops only when streaks changed)
+      let mv = null, md = 1e9, ms = 0, es = null, ee = 0;
+      for (const s of w.streaks) {
+        if (s === cur || !near(s, d.x, d.y, reach)) continue;
+        project(s, d.x, d.y);
+        if (PJd > reach) continue;
+        if (remaining(s, PJs) >= 0.3) { if (PJd < md) { md = PJd; mv = s; ms = PJs; } }
+        else if (!cur && !es) { es = s; ee = PJs; }
+      }
+      if (mv) { cur = mv; curS = ms; atEnd = false; }
+      else if (!cur && es) { cur = es; curS = ee; atEnd = true; }
+      d.chk = cur ? -1 : w.ver;
+    }
+    if (cur !== d.on && d.trail) endTrail(w, d);
+    d.on = cur;
+    if (cur) {                                  // along a streak, or gathered at its lower end
+      d.run = false;
+      const v = slideSpeed(d.m) * DT;
+      pointAt(cur, atEnd ? lowEnd(cur) : clamp(curS + cur.down * v, 0, cur.len));
+      moveToward(d, PX, PY, v + 0.15 * Math.hypot(PX - d.x, PY - d.y));
+    } else if (d.m >= BIG) {                    // heavy: runs down in a wobbly line, leaning towards wet glass
+      d.run = true;
+      const v = runSpeed(d.m), sy = d.y + d.r + 1.5;
+      let vx = v * d.amp * (Math.sin(d.ph + w.t * d.fr) + 0.5 * Math.sin(d.ph * 1.7 + w.t * d.fr * 2.3));
+      vx += 7 * (wetAt(d.x + 2.5, sy) - wetAt(d.x - 2.5, sy));
+      vx = clamp(vx, -0.5 * v, 0.5 * v);
+      d.x = clamp(d.x + vx * DT, d.r, GW - d.r); d.y += v * DT;
+      const cx = Math.floor(d.x / CELL), cy = Math.floor(d.y / CELL);
+      for (let ox = -1; ox <= 1; ox++) { const x = cx + ox; if (x >= 0 && x < WX && cy >= 0 && cy < WY) w.wet[cy * WX + x] = Math.max(w.wet[cy * WX + x], ox ? 0.6 : 1); }
+      if (!d.trail) d.trail = [[d.x, d.y - d.r * 0.5]];
+      const lt = d.trail[d.trail.length - 1];
+      if (Math.hypot(d.x - lt[0], d.y - lt[1]) > 1.2) d.trail.push([d.x, d.y]);
+    } else {                                    // small: clings to the glass, and the smallest slowly dry up
+      d.run = false;
+      d.ev -= DT;
+      if (d.ev <= 0) d.dead = true;
+    }
+    if (!d.dead && d.y + d.r >= GH) leave(w, d);
+  }
+  merges(w);
+  const k = Math.exp(-DT / 25);
+  for (let i = 0; i < w.wet.length; i++) w.wet[i] *= k;
+  for (const tr of w.trails) tr.age += DT;
+  if (w.trails.length && w.trails[0].age > 20) w.trails = w.trails.filter(tr => tr.age <= 20);
+  if (w.drops.some(d => d.dead)) w.drops = w.drops.filter(d => !d.dead);
+  if (!w.won && !w.warm && w.ready && w.notches.every(n => n.filled)) { w.won = true; w.wonAt = w.t; }
+}
+
+function endTrail(w, d) { if (d.trail && d.trail.length > 1) w.trails.push({ pts: d.trail, r: d.r, age: 0 }); d.trail = null; }
+
+// a drop reaches the sill: into a ring's notch, or it runs off
+function leave(w, d) {
+  d.dead = true; endTrail(w, d);
+  if (w.warm || w.won || !w.ready) return;
+  for (const n of w.notches) {
+    if (n.filled || Math.abs(d.x - n.x) > n.half) continue;
+    if (d.m >= n.need) { n.filled = true; n.at = w.t; }
+    else n.small = { m: d.m, t: w.t };
+    return;
+  }
+}
+
+// drops that touch become one
+const GC = 12, GX = Math.ceil(GW / GC), GY = Math.ceil(GH / GC) + 1;
+const grid = Array.from({ length: GX * GY }, () => []);
+const cellOf = d => clamp(Math.floor(d.y / GC), 0, GY - 1) * GX + clamp(Math.floor(d.x / GC), 0, GX - 1);
+function merges(w) {
+  for (const c of grid) c.length = 0;
+  for (const d of w.drops) if (!d.dead) grid[cellOf(d)].push(d);
+  for (const a of w.drops) {
+    if (a.dead) continue;
+    const cx = clamp(Math.floor(a.x / GC), 0, GX - 1), cy = clamp(Math.floor(a.y / GC), 0, GY - 1);
+    scan: for (let y = cy - 1; y <= cy + 1; y++) for (let x = cx - 1; x <= cx + 1; x++) {
+      if (x < 0 || y < 0 || x >= GX || y >= GY) continue;
+      for (const b of grid[y * GX + x]) {
+        if (b === a || b.dead) continue;
+        const lim = (a.r + b.r) * 0.9, dx = a.x - b.x, dy = a.y - b.y;
+        if (dx * dx + dy * dy >= lim * lim) continue;
+        if (merge(w, a, b) !== a) break scan;
+      }
+    }
+  }
+}
+function merge(w, a, b) {
+  let S, O;
+  if (a.on && !b.on) { S = a; O = b; } else if (b.on && !a.on) { S = b; O = a; }
+  else if (a.run !== b.run) { S = a.run ? a : b; O = S === a ? b : a; }
+  else if (a.m !== b.m) { S = a.m > b.m ? a : b; O = S === a ? b : a; }
+  else { S = a; O = b; }
+  if (!S.on && !S.run) { S.x = (S.x * S.m + O.x * O.m) / (S.m + O.m); S.y = (S.y * S.m + O.y * O.m) / (S.m + O.m); }
+  S.m += O.m; S.r = rad(S.m); S.ev = evapLife(S); S.age = Math.max(S.age, 1); S.chk = -1;
+  O.dead = true; endTrail(w, O);
+  return S;
+}
+
+// ---------- a patient player: funnels rain to a point above each ring, then opens the way down ----------
+function makeBot(w) { return w.notches.map(() => ({ drawn: -1e9, rel: 0, tries: 0, round: 0 })); }
+function botAct(bot, w) {
+  w.notches.forEach((n, i) => {
+    if (n.filled) return;
+    const p = bot[i];
+    if (p.rel) { if (w.t - p.rel < 12) return; p.tries++; p.rel = 0; p.drawn = -1e9; }
+    const px = n.x, py = GH - 24 - (p.tries % 3) * 14, L = w.spec.maxLen;
+    if (w.t - p.drawn > 15) {                    // a fan of three strokes from the gathering point, turned a little each time
+      p.drawn = w.t; p.round++;
+      const turn = (p.round * 17) % 36 - 18;
+      for (const a0 of [-42, 0, 42]) {
+        const a = (a0 + turn) * Math.PI / 180;
+        line(w, px, py, clamp(px + Math.sin(a) * L, 1, GW - 1), py - Math.cos(a) * L);
+      }
+    }
+    const pool = w.drops.find(d => d.on && Math.abs(d.x - px) < 1.5 && Math.abs(d.y - py) < 1.5);
+    if (pool && pool.m >= n.need) { line(w, px, py, px, GH); p.rel = w.t; }
+  });
+}
+function botRun(spec, limit) {
+  const w = makeWorld(spec), bot = makeBot(w);
+  while (!w.won && w.t < limit) { botAct(bot, w); step(w); }
+  return w.won ? w.t : -1;
+}
+// a level is offered only once the patient player has finished it; otherwise its biggest ring shrinks and it is tried again.
+// The check runs in small slices, so the rain can already fall while it works.
+function makeCheck(spec) {
+  const needs = spec.notches.map(n => n.need);
+  let w = null, bot = null;
+  return { needs, done: false, run(ms) {
+    const t0 = performance.now();
+    while (!this.done && performance.now() - t0 < ms) {
+      if (!w) { w = makeWorld({ ...spec, notches: spec.notches.map((n, i) => ({ x: n.x, need: needs[i] })) }); bot = makeBot(w); }
+      for (let i = 0; i < 60 && !w.won && w.t < LIMIT; i++) { botAct(bot, w); step(w); }
+      if (w.won) this.done = true;
+      else if (w.t >= LIMIT) {
+        const k = needs.indexOf(Math.max(...needs));
+        if (needs[k] > 4) needs[k]--; else this.done = true;
+        w = null;
+      }
+    }
+    return this.done;
+  } };
+}
+function checkedSpec(n) {
+  const spec = specFor(n), c = makeCheck(spec);
+  c.run(1e9);
+  spec.notches.forEach((x, i) => { x.need = c.needs[i]; });
+  return spec;
+}
+
+// ---------- level state ----------
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+let world, check, drawing = null, inputQ = [], wonSeen = false, shownAt = 0;
+function newLevel(n) {
+  level = n;
+  lvlLabel.textContent = n + " / " + TOTAL;
+  const spec = specFor(n);
+  world = makeWorld(spec); world.ready = false;
+  check = makeCheck(spec);
+  drawing = null; inputQ = []; wonSeen = false;
+  endBox.classList.add("hidden");
+  hint.classList.toggle("hidden", n !== 1);
+  layout();
+}
+function checkSlice(ms) {   // once the check is done, the rings take their sizes and start accepting drops
+  if (world.ready || !check.run(ms)) return;
+  world.notches.forEach((x, i) => { x.need = check.needs[i]; x.half = Math.max(3.5, rad(x.need) + 1); });
+  world.ready = true; world.readyAt = world.t;
+}
+
+// ---------- layout ----------
+let W, H, dpr, sc, gx, gy, gw, gh, frameW, sillH;
+const bokeh = document.createElement("canvas");
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = window.devicePixelRatio || 1;
+  cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px";
+  const safeTop = document.getElementById("probe").offsetHeight || 0;
+  const top = safeTop + 52, bottom = 64;
+  sc = Math.min((W - 28) / GW, (H - top - bottom) / GH);
+  gw = GW * sc; gh = GH * sc; gx = (W - gw) / 2; gy = top + Math.max(0, (H - top - bottom - gh) / 2) * 0.4;
+  frameW = Math.max(7, sc * 2.2); sillH = Math.max(16, sc * 4.5);
+  bar.style.right = Math.max(8, W - gx - gw - frameW) + "px";
+  endBox.style.top = (gy + gh * 0.42 - 24) + "px";
+  hint.style.top = (gy + gh + sillH + 12) + "px";
+  if (world) paintBokeh(seedFor(level) ^ 0x51ed27);
+}
+
+// ---------- drawing ----------
+const ROOM = "#070c17", FRAME = "#18223b", FRAME_LIT = "#24304f", SILL = "#212c48", SILL_LIT = "#34426a";
+const RING = "245,220,174", AMBER = "255,190,110";
+const X = x => gx + x * sc, Y = y => gy + y * sc;
+let glows = [];
+function paintBokeh(s) {
+  bokeh.width = Math.max(1, Math.round(gw * dpr)); bokeh.height = Math.max(1, Math.round(gh * dpr));
+  const b = bokeh.getContext("2d"), R = rng(s), u = sc / 4;
+  b.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const g = b.createLinearGradient(0, 0, 0, gh);
+  g.addColorStop(0, "#0d1a36"); g.addColorStop(0.5, "#12254e"); g.addColorStop(1, "#182c54");
+  b.fillStyle = g; b.fillRect(0, 0, gw, gh);
+  const COLS = ["255,158,52", "255,196,96", "242,96,146", "44,204,194", "255,222,160"];
+  const disc = (x, y, r, c, a) => {
+    const rg = b.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, `rgba(${c},${a})`); rg.addColorStop(0.72, `rgba(${c},${a * 0.85})`); rg.addColorStop(1, `rgba(${c},0)`);
+    b.fillStyle = rg; b.beginPath(); b.arc(x, y, r, 0, 7); b.fill();
+  };
+  // near lights: big soft discs in amber, rose and teal
+  for (let i = 0; i < 14; i++) {
+    const x = R() * gw, y = gh * (0.2 + R() * 0.8), c = COLS[[0, 2, 3, 0, 2, 3, 1][Math.floor(R() * 7)]];
+    disc(x, y, (14 + R() * R() * 34) * u, c, 0.22 + R() * 0.18);
+  }
+  // a far street: a row of warm lamps, lit windows above it
+  const street = gh * (0.56 + R() * 0.1);
+  for (let i = 0; i < 24; i++) {
+    const x = R() * gw, y = street + (R() - 0.5) * gh * 0.05, c = COLS[R() < 0.8 ? (R() < 0.6 ? 0 : 1) : 4];
+    disc(x, y, (5 + R() * 8) * u, c, 0.45 + R() * 0.3);
+  }
+  for (let i = 0; i < 20; i++) {
+    const x = R() * gw, y = street - gh * (0.08 + R() * 0.42), c = COLS[R() < 0.45 ? 1 : R() < 0.5 ? 4 : 3];
+    disc(x, y, (4 + R() * 6) * u, c, 0.25 + R() * 0.25);
+  }
+  b.fillStyle = "rgba(14,30,64,0.14)"; b.fillRect(0, 0, gw, gh);
+  glows = [];
+  for (let i = 0; i < 5; i++) glows.push({ x: R() * gw, y: street + (R() - 0.5) * gh * 0.2, r: (8 + R() * 10) * u, c: COLS[Math.floor(R() * 4)], ph: R() * 6.28 });
+}
+
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); }
+// one drop, drawn once at high resolution: a lens showing a warm light below, a dark rim and a soft highlight
+const sprite = document.createElement("canvas"), SPR = 48, SPR_R = 44;
+(() => {
+  sprite.width = sprite.height = SPR * 2;
+  const b = sprite.getContext("2d"), R = SPR_R, c = SPR;
+  const g = b.createRadialGradient(c, c + R * 0.35, 0, c, c + R * 0.1, R * 1.05);
+  g.addColorStop(0, "rgba(255,226,186,0.62)"); g.addColorStop(0.45, "rgba(170,198,236,0.36)");
+  g.addColorStop(0.85, "rgba(40,62,104,0.55)"); g.addColorStop(1, "rgba(14,24,48,0.75)");
+  b.fillStyle = g; b.beginPath(); b.arc(c, c, R, 0, 7); b.fill();
+  b.strokeStyle = "rgba(214,232,255,0.7)"; b.lineWidth = R * 0.07; b.beginPath(); b.arc(c, c, R - R * 0.035, 0, 7); b.stroke();
+  b.fillStyle = "rgba(250,252,255,0.95)"; b.beginPath(); b.ellipse(c - R * 0.36, c - R * 0.4, R * 0.26, R * 0.17, -0.7, 0, 7); b.fill();
+  b.fillStyle = "rgba(255,255,255,0.35)"; b.beginPath(); b.ellipse(c + R * 0.4, c + R * 0.45, R * 0.14, R * 0.08, -0.7, 0, 7); b.fill();
+})();
+function drawDrop(d, ready) {
+  let R = d.r * sc, a = 1;
+  if (d.age < 0.3) R *= 0.4 + 0.6 * d.age / 0.3;
+  if (d.ev < 3) { a = Math.max(0, d.ev / 3); R *= 0.6 + 0.4 * a; }
+  const x = X(d.x), y = Y(d.y), k = R * SPR / SPR_R;
+  ctx.globalAlpha = a;
+  ctx.drawImage(sprite, x - k, y - k, 2 * k, 2 * k);
+  if (ready) { circle(x, y, R + 2.5); ctx.strokeStyle = `rgba(${AMBER},0.8)`; ctx.lineWidth = 1.5; ctx.stroke(); }
+  ctx.globalAlpha = 1;
+}
+function polyline(pts) {
+  ctx.beginPath();
+  pts.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
+}
+function draw() {
+  const w = world;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = ROOM; ctx.fillRect(0, 0, W, H);
+  // window frame and sill
+  ctx.fillStyle = FRAME; ctx.fillRect(gx - frameW, gy - frameW, gw + 2 * frameW, gh + frameW + sillH);
+  ctx.fillStyle = FRAME_LIT; ctx.fillRect(gx - frameW, gy - frameW, gw + 2 * frameW, 2);
+  const sy = gy + gh;
+  ctx.fillStyle = SILL; ctx.fillRect(gx - frameW - 6, sy, gw + 2 * frameW + 12, sillH);
+  ctx.fillStyle = SILL_LIT; ctx.fillRect(gx - frameW - 6, sy, gw + 2 * frameW + 12, 2);
+  // glass
+  ctx.drawImage(bokeh, gx, gy, gw, gh);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(gx, gy, gw, gh); ctx.clip();
+  if (!reduceMotion) {
+    ctx.globalCompositeOperation = "lighter";
+    for (const g of glows) {
+      const a = 0.08 + 0.06 * Math.sin(g.ph + w.t * 0.25), rg = ctx.createRadialGradient(gx + g.x, gy + g.y, 0, gx + g.x, gy + g.y, g.r);
+      rg.addColorStop(0, `rgba(${g.c},${a})`); rg.addColorStop(1, `rgba(${g.c},0)`);
+      ctx.fillStyle = rg; circle(gx + g.x, gy + g.y, g.r); ctx.fill();
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  // trails left by heavy drops
+  for (const tr of w.trails) {
+    const a = 0.16 * (1 - tr.age / 20); if (a <= 0) continue;
+    polyline(tr.pts); ctx.strokeStyle = `rgba(150,186,230,${a})`; ctx.lineWidth = tr.r * sc * 1.1; ctx.stroke();
+  }
+  for (const d of w.drops) if (d.trail && d.trail.length > 1) {
+    polyline(d.trail); ctx.lineTo(X(d.x), Y(d.y)); ctx.strokeStyle = "rgba(150,186,230,0.16)"; ctx.lineWidth = d.r * sc * 1.1; ctx.stroke();
+  }
+  // drawn streaks: wet glass, drying at the end of their life
+  for (const s of w.streaks) {
+    const a = Math.min(1, (LIFE - s.age) / FADE);
+    polyline(s.pts);
+    if (s.pts.length === 1) ctx.lineTo(X(s.pts[0][0]) + 0.1, Y(s.pts[0][1]));
+    ctx.strokeStyle = `rgba(140,184,236,${0.1 * a})`; ctx.lineWidth = WIDE * 2.6 * sc; ctx.stroke();
+    ctx.strokeStyle = `rgba(160,200,248,${0.13 * a})`; ctx.lineWidth = WIDE * 1.6 * sc; ctx.stroke();
+    ctx.strokeStyle = `rgba(214,232,255,${0.14 * a})`; ctx.lineWidth = WIDE * 0.5 * sc; ctx.stroke();
+  }
+  // rings: the size of drop each notch is waiting for
+  let need = Infinity;
+  const show = w.ready ? Math.min(1, (w.t - w.readyAt) / 1.2) : 0;
+  ctx.globalAlpha = show;
+  for (const n of w.notches) {
+    const r = rad(n.need), x = X(n.x), y = Y(GH - r - 0.6), R = r * sc;
+    if (n.filled) {
+      const k = Math.min(1, (w.t - n.at) / 1.2);
+      circle(x, y, R * (0.5 + 0.5 * k)); ctx.fillStyle = `rgba(${AMBER},${0.55 * k + 0.1})`; ctx.fill();
+      circle(x - R * 0.35, y - R * 0.35, R * 0.22); ctx.fillStyle = `rgba(255,246,228,${0.9 * k})`; ctx.fill();
+      circle(x, y, R); ctx.strokeStyle = `rgba(${AMBER},0.9)`; ctx.lineWidth = 2; ctx.stroke();
+    } else {
+      need = Math.min(need, n.need);
+      circle(x, y, R); ctx.fillStyle = `rgba(${RING},0.07)`; ctx.fill();
+      ctx.strokeStyle = `rgba(${RING},0.7)`; ctx.lineWidth = 1.6; ctx.stroke();
+      if (n.small && w.t - n.small.t < 2.5) {     // a drop that was too small: shown inside the ring for a moment
+        const a = 1 - (w.t - n.small.t) / 2.5;
+        circle(x, y + R - rad(n.small.m) * sc, rad(n.small.m) * sc); ctx.fillStyle = `rgba(170,200,238,${0.45 * a})`; ctx.fill();
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+  if (!w.ready) need = Infinity;
+  for (const d of w.drops) drawDrop(d, d.m >= need && d.age > 0.3);
+  ctx.restore();
+  // notches cut into the sill
+  for (const n of w.notches) {
+    const x = X(n.x), hw = n.half * sc * 0.8, dep = sillH * 0.5;
+    ctx.beginPath(); ctx.moveTo(x - hw, sy); ctx.lineTo(x + hw, sy); ctx.lineTo(x + hw * 0.6, sy + dep); ctx.lineTo(x - hw * 0.6, sy + dep); ctx.closePath();
+    ctx.fillStyle = n.filled ? `rgba(${AMBER},0.85)` : "#0c1324"; ctx.fill();
+  }
+}
+
+// ---------- input: a finger draws wet streaks on the glass ----------
+const toGlass = e => [(e.clientX - gx) / sc, (e.clientY - gy) / sc];
+let pid = null;
+cv.addEventListener("pointerdown", e => {
+  if (world.won || pid !== null) return;
+  const [x, y] = toGlass(e);
+  if (x < -3 || x > GW + 3 || y < -3 || y > GH + 4) return;
+  pid = e.pointerId; try { cv.setPointerCapture(pid); } catch (err) {}
+  inputQ.push({ k: "s", x, y });
+});
+cv.addEventListener("pointermove", e => {
+  if (e.pointerId !== pid) return;
+  const [x, y] = toGlass(e);
+  inputQ.push({ k: "m", x, y });
+});
+const up = e => { if (e.pointerId !== pid) return; pid = null; inputQ.push({ k: "e" }); };
+cv.addEventListener("pointerup", up);
+cv.addEventListener("pointercancel", up);
+cv.addEventListener("lostpointercapture", up);
+function applyInput() {   // input lands between two steps, so the same strokes give the same rain
+  for (const op of inputQ) {
+    if (op.k === "s") { if (drawing) finish(world, drawing); drawing = newStreak(world, op.x, op.y); }
+    else if (op.k === "m" && drawing) extend(world, drawing, op.x, op.y);
+    else if (op.k === "e" && drawing) { finish(world, drawing); drawing = null; }
+  }
+  inputQ.length = 0;
+}
+nextBtn.addEventListener("click", () => newLevel(level % TOTAL + 1));
+
+// ---------- loop ----------
+function tick() {
+  checkSlice(18);
+  applyInput();
+  for (let i = 0; i < SPEEDS[speedIdx]; i++) step(world);
+  if (world.won && !wonSeen) { wonSeen = true; shownAt = world.t; saved.set(level % TOTAL + 1); hint.classList.add("hidden"); }
+  if (wonSeen && endBox.classList.contains("hidden") && world.t - shownAt > 1.5) endBox.classList.remove("hidden");
+}
+let last = 0;
+function frame(t) {
+  if (t - last >= 30) { last = t; tick(); draw(); }   // about 30 frames a second is plenty
+  requestAnimationFrame(frame);
+}
+speedBtn.addEventListener("click", () => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  speedBtn.textContent = SPEEDS[speedIdx] + "×";
+});
+addEventListener("resize", () => { layout(); });
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>

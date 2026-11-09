@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161b2e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Opossums</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #161b2e; overflow: hidden;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; }
+  button { font: 15px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em;
+    color: #e3e7f6; background: #222943; border: 1px solid #56608a; border-radius: 6px;
+    width: 104px; height: 46px; cursor: pointer; }
+  button:active { background: #1a2036; }
+  button:focus-visible, #home:focus-visible { outline: 2px solid #e3e7f6; outline-offset: 3px; }
+  #home { position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 12px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #98a1c4; text-decoration: none; }
+  #lvl { position: fixed; top: calc(8px + env(safe-area-inset-top)); right: 12px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .08em; color: #98a1c4; }
+  #rules { position: fixed; margin: 0; text-align: center; font: 13px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #b7bfdc; }
+  #tools { position: fixed; display: flex; justify-content: space-between; }
+  #tools button { width: auto; padding: 0 14px; font-size: 13px; color: #b7bfdc; }
+  #rulesBtn { background: none; border-color: transparent; padding: 0 4px !important; }
+  #end { position: fixed; left: 0; right: 0; display: flex; justify-content: center; }
+  .hidden { display: none !important; }
+  .gone { visibility: hidden; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="lvl"></div>
+<p id="rules" class="hidden">one opossum in every row, every column and every colour.<br>opossums never touch, not even at a corner.<br>one tap: a leaf (no opossum here). two taps: an opossum.<br>drag across cells to lay many leaves.</p>
+<div id="tools"><button id="rulesBtn">rules</button><button id="undo">undo</button></div>
+<div id="end" class="hidden"><button id="next">next</button></div>
+<script>
+"use strict";
+// ---------- puzzle core ----------
+// seeded random
+let seed = 0;
+function rnd() { // mulberry32
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = ri(0, i); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+
+// a valid answer: one opossum per row and column, rows next to each other two or more columns apart
+function makeSolution(n) {
+  const col = new Array(n), used = new Array(n).fill(false);
+  const go = r => {
+    if (r === n) return true;
+    for (const c of shuffle([...Array(n).keys()])) {
+      if (used[c] || (r > 0 && Math.abs(col[r - 1] - c) < 2)) continue;
+      used[c] = true; col[r] = c;
+      if (go(r + 1)) return true;
+      used[c] = false;
+    }
+    return false;
+  };
+  go(0);
+  return col;
+}
+
+// regions grow outwards from each opossum, one cell at a time; each region has its own appetite
+function growRegions(n, col) {
+  const reg = new Int8Array(n * n).fill(-1), w = [];
+  for (let r = 0; r < n; r++) { reg[r * n + col[r]] = r; w[r] = 0.3 + rnd() * 1.7; }
+  const cells = [], regs = [], ws = [];
+  for (let left = n * n - n; left > 0; left--) {
+    cells.length = regs.length = ws.length = 0; let tot = 0;
+    for (let i = 0; i < n * n; i++) {
+      if (reg[i] >= 0) continue;
+      const x = i % n, y = (i / n) | 0;
+      const nb = [x > 0 ? reg[i - 1] : -1, x < n - 1 ? reg[i + 1] : -1, y > 0 ? reg[i - n] : -1, y < n - 1 ? reg[i + n] : -1];
+      for (let k = 0; k < 4; k++) {
+        const g = nb[k]; if (g < 0 || nb.indexOf(g) < k) continue;
+        cells.push(i); regs.push(g); ws.push(w[g]); tot += w[g];
+      }
+    }
+    let p = rnd() * tot, j = 0;
+    while (j < ws.length - 1 && (p -= ws[j]) > 0) j++;
+    reg[cells[j]] = regs[j];
+  }
+  return reg;
+}
+
+// looks for an answer other than the given one: rows in order, columns and regions used once, no touching
+function findOther(n, reg, col) {
+  const cur = new Array(n);
+  const go = (r, prev, cols, regs) => {
+    if (r === n) { for (let i = 0; i < n; i++) if (cur[i] !== col[i]) return true; return false; }
+    for (let c = 0; c < n; c++) {
+      if ((cols >> c) & 1 || (r > 0 && Math.abs(c - prev) < 2)) continue;
+      const g = reg[r * n + c]; if ((regs >> g) & 1) continue;
+      cur[r] = c;
+      if (go(r + 1, c, cols | (1 << c), regs | (1 << g))) return true;
+    }
+    return false;
+  };
+  return go(0, -1, 0, 0) ? cur : null;
+}
+
+// while a second answer exists, hand one of its cells to a neighbouring region; the intended answer stays valid
+function makeUnique(n, reg, col) {
+  for (let fix = 0; fix < n * 8; fix++) {
+    const alt = findOther(n, reg, col);
+    if (!alt) return true;
+    const moves = [];
+    for (let r = 0; r < n; r++) {
+      if (alt[r] === col[r]) continue;
+      const c = r * n + alt[r], g = reg[c], x = alt[r];
+      for (const d of [x > 0 ? c - 1 : -1, x < n - 1 ? c + 1 : -1, r > 0 ? c - n : -1, r < n - 1 ? c + n : -1])
+        if (d >= 0 && reg[d] !== g) moves.push([c, reg[d]]);
+    }
+    if (!moves.length) return false;
+    const [c, h] = moves[ri(0, moves.length - 1)], g = reg[c];
+    reg[c] = h;
+    // any part of region g cut off from its opossum joins region h too (it touched cell c)
+    const seen = new Uint8Array(n * n), q = [g * n + col[g]]; seen[q[0]] = 1;
+    while (q.length) {
+      const i = q.pop(), x = i % n;
+      for (const d of [x > 0 ? i - 1 : -1, x < n - 1 ? i + 1 : -1, i - n, i + n])
+        if (d >= 0 && d < n * n && !seen[d] && reg[d] === g) { seen[d] = 1; q.push(d); }
+    }
+    for (let i = 0; i < n * n; i++) if (reg[i] === g && !seen[i]) reg[i] = h;
+  }
+  return false;
+}
+const sizeOf = (n, reg, g) => { let k = 0; for (let i = 0; i < n * n; i++) k += reg[i] === g; return k; };
+
+// ---------- a patient player's reasoning, from simplest to hardest ----------
+// tier 1: a row, column or region with one free cell left takes the opossum
+// tier 2: a cell that touches or shares a line with every free cell of another row, column or region gets a leaf
+// tier 3: two regions that fit inside two rows (or columns, and the other way round) fill them
+// tier 4: the same with three or four
+function makeBoard(n, reg) {
+  const units = [], unitsOf = [], kill = [];
+  for (let u = 0; u < 3 * n; u++) units.push([]);
+  for (let i = 0; i < n * n; i++) {
+    const x = i % n, y = (i / n) | 0;
+    unitsOf.push([y, n + x, 2 * n + reg[i]]);
+    units[y].push(i); units[n + x].push(i); units[2 * n + reg[i]].push(i);
+  }
+  for (let i = 0; i < n * n; i++) {
+    const x = i % n, y = (i / n) | 0, s = new Set();
+    for (const u of unitsOf[i]) for (const j of units[u]) s.add(j);
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < n && ny < n) s.add(ny * n + nx);
+    }
+    s.delete(i); kill.push([...s]);
+  }
+  return { n, reg, units, unitsOf, kill };
+}
+
+function solveLogic(B, maxTier) {
+  const { n, units, unitsOf, kill } = B, N = n * n;
+  const st = { cand: new Uint8Array(N).fill(1), placed: new Uint8Array(N), count: 0 };
+  const stats = { top: 0, uses: [0, 0, 0, 0, 0], ok: true };
+  const place = (s, c) => { s.placed[c] = 1; s.cand[c] = 0; s.count++; for (const k of kill[c]) s.cand[k] = 0; };
+  const solvedUnit = (s, u) => units[u].some(c => s.placed[c]);
+  // places every forced opossum; -1 on a dead end
+  const step1 = s => {
+    let moved = true, any = false;
+    while (moved) {
+      moved = false;
+      for (let u = 0; u < 3 * n; u++) {
+        if (solvedUnit(s, u)) continue;
+        let last = -1, k = 0;
+        for (const c of units[u]) if (s.cand[c]) { k++; last = c; }
+        if (k === 0) return -1;
+        if (k === 1) { place(s, last); moved = any = true; }
+      }
+    }
+    return any ? 1 : 0;
+  };
+  const step2 = s => {
+    let any = false;
+    for (let c = 0; c < N; c++) {
+      if (!s.cand[c]) continue;
+      const kc = kill[c];
+      for (let u = 0; u < 3 * n; u++) {
+        if (unitsOf[c].includes(u) || solvedUnit(s, u)) continue;
+        let blocked = true;
+        for (const d of units[u]) if (s.cand[d] && !kc.includes(d)) { blocked = false; break; }
+        if (blocked) { s.cand[c] = 0; any = true; break; }
+      }
+    }
+    return any;
+  };
+  // pigeonhole: k units of type A whose free cells lie inside k units of type B
+  const pairs = [[2, 0], [2, 1], [0, 2], [1, 2], [0, 1], [1, 0]];
+  const stepK = (s, kmin, kmax) => {
+    for (const [ta, tb] of pairs) {
+      const open = [], masks = [];
+      for (let a = 0; a < n; a++) {
+        const u = ta * n + a; if (solvedUnit(s, u)) continue;
+        let m = 0;
+        for (const c of units[u]) if (s.cand[c]) m |= 1 << (unitsOf[c][tb] - tb * n);
+        open.push(a); masks.push(m);
+      }
+      for (let k = kmin; k <= kmax && k < open.length; k++) {
+        const idx = [...Array(k).keys()];
+        while (true) {
+          let m = 0, mine = 0;
+          for (const t of idx) { m |= masks[t]; mine |= 1 << open[t]; }
+          let pc = 0; for (let b = m; b; b &= b - 1) pc++;
+          if (pc === k) {
+            let any = false;
+            for (let b = 0; b < n; b++) if ((m >> b) & 1)
+              for (const c of units[tb * n + b])
+                if (s.cand[c] && !((mine >> (unitsOf[c][ta] - ta * n)) & 1)) { s.cand[c] = 0; any = true; }
+            if (any) return true;
+          }
+          let p = k - 1;
+          while (p >= 0 && idx[p] === open.length - k + p) p--;
+          if (p < 0) break;
+          idx[p]++; for (let q = p + 1; q < k; q++) idx[q] = idx[q - 1] + 1;
+        }
+      }
+    }
+    return false;
+  };
+  const use = t => { stats.uses[t]++; if (t > stats.top) stats.top = t; };
+  while (st.count < n) {
+    const r = step1(st);
+    if (r < 0) { stats.ok = false; break; }
+    if (r) { use(1); continue; }
+    if (maxTier >= 2 && step2(st)) { use(2); continue; }
+    if (maxTier >= 3 && stepK(st, 2, 2)) { use(3); continue; }
+    if (maxTier >= 4 && stepK(st, 3, 4)) { use(4); continue; }
+    stats.ok = false; break;
+  }
+  stats.solved = stats.ok && st.count === n;
+  stats.placed = st.placed;
+  return stats;
+}
+
+// ---------- levels ----------
+const TOTAL = 300;
+function sizeFor(lv) {
+  if (lv <= 12) return 5;
+  if (lv <= 40) return 6;
+  if (lv <= 90) return 7;
+  if (lv <= 160) return 8;
+  if (lv <= 240) return 9;
+  return 10;
+}
+const hardFor = lv => lv > 3 && lv % 5 === 0;  // every fifth level a slightly harder one
+function targetFor(lv) {     // [hardest reasoning allowed, hardest reasoning required]
+  const n = sizeFor(lv), hard = hardFor(lv);
+  if (lv <= 3) return [2, 1];
+  if (hard) return n <= 6 ? [3, 3] : [4, 3];
+  return n <= 7 ? [2, 2] : [3, 2];
+}
+
+function generate(lv) {
+  const n = sizeFor(lv), [maxT, minT] = targetFor(lv), base = seedFor(lv);
+  let fallback = null;
+  for (let a = 0; a < 4000; a++) {
+    seed = (base + Math.imul(a, 0x9e3779b1)) | 0;
+    const col = makeSolution(n), reg = growRegions(n, col);
+    if (!makeUnique(n, reg, col)) continue;
+    let ones = 0; for (let g = 0; g < n; g++) ones += sizeOf(n, reg, g) === 1;
+    if (ones > 1) continue;
+    const st = solveLogic(makeBoard(n, reg), maxT);
+    if (!st.solved) continue;
+    if (st.top >= minT) return { n, reg, col, top: st.top, tries: a + 1 };
+    if (!fallback || st.top > fallback.top) fallback = { n, reg, col, top: st.top, tries: a + 1 };
+  }
+  return fallback;
+}
+// ---------- end core ----------
+
+// ---------- look ----------
+const NIGHT = "#161b2e";
+const REGION = ["#d98a92", "#e09a68", "#d9c36e", "#a9c872", "#74b98a", "#62b8b0", "#6aa6d8", "#c8b39a", "#a98ad6", "#d18cc2"];
+const CLASH = "#ffe0d6";   // soft peach: the halo around opossums that disagree, and the stripes on their line or region
+const SPR = { k: "#1d1a27", g: "#aeacb9", G: "#8a8796", w: "#f4f0e8", p: "#f3a3b6", P: "#d7819a", e: "#1d1a27", l: "#2f5a35", L: "#5f9a57", z: "#eef0ff" };
+const AWAKE = [
+  ".kkk.......kkk.",
+  "kpppk.....kpppk",
+  "kpPPkkkkkkkPPpk",
+  "kpPkwwwwwwwkPpk",
+  ".kkwwwwwwwwwkk.",
+  "..kwekwwwkewk..",
+  "..kwkkwwwkkwk..",
+  "...kwwwwwwwk...",
+  "....kwwwwwk....",
+  "...kGkwwwkGk...",
+  "..kgggkpkgggk..",
+  ".kggggkkkggggk.",
+  ".kgggggggggggk.",
+  ".kGgggggggggGkk",
+  "..kpkkkkkkkpkpk",
+  "...k.......kpk.",
+];
+const ASLEEP = [                 // curled up, nose tucked in, tail wrapped round
+  "...............",
+  "...............",
+  "....kkkkkkk....",
+  "..kkgggggggkk..",
+  ".kgggggggggggk.",
+  ".kggggggggkkkk.",
+  "kggggggggkpwwwk",
+  "kgggggggkwwwwwk",
+  "kggggggkwkkwwpk",
+  "kGgggggkwwwwwk.",
+  "kGGgggggkkkkk..",
+  ".kGGGgggggGGkk.",
+  "..kkkkkkkkkkppk",
+  ".........kkkkk.",
+];
+const LEAF = ["....kk", "..kkLk", ".kLLlk", "kLLlk.", "klLlk.", "kllk..", "kk...."];
+const ZED = ["kkkkkk", "kzzzzk", "kkkzkk", ".kzkk.", "kzkkkk", "kzzzzk", "kkkkkk"];
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const endBox = document.getElementById("end");
+const nextBtn = document.getElementById("next");
+const lvlLabel = document.getElementById("lvl");
+const rulesText = document.getElementById("rules");
+const tools = document.getElementById("tools");
+const rulesBtn = document.getElementById("rulesBtn");
+const undoBtn = document.getElementById("undo");
+const calm = matchMedia("(prefers-reduced-motion: reduce)");
+
+// ---------- storage: progress, the board in progress, and the puzzles already built ----------
+const GEN = 1;                   // bump when the generator changes, so old cached puzzles are dropped
+const store = {
+  get(k) { try { return localStorage.getItem("opossums." + k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem("opossums." + k, v); } catch (e) {} },
+};
+const saved = {
+  get() { return parseInt(store.get("level"), 10) || 1; },
+  set(n) { store.set("level", String(n)); },
+};
+function readCache() {
+  try { const c = JSON.parse(store.get("cache")); if (c && c.v === GEN && c.items) return c; } catch (e) {}
+  return { v: GEN, items: {} };
+}
+function puzzleFor(lv) {         // from the cache when possible, otherwise built here and now
+  const c = readCache(), it = c.items[lv], n = sizeFor(lv);
+  if (it && it.r && it.r.length === n * n && it.s && it.s.length === n)
+    return { n, reg: Int8Array.from(it.r, ch => +ch), col: Array.from(it.s, ch => +ch) };
+  const p = generate(lv);
+  c.items = { [lv]: { r: Array.from(p.reg).join(""), s: p.col.join("") }, ...(c.items[lv + 1] ? { [lv + 1]: c.items[lv + 1] } : {}) };
+  store.set("cache", JSON.stringify(c));
+  return p;
+}
+function cacheAhead(lv) {        // builds the following level while the player thinks
+  if (lv > TOTAL) return;
+  const c = readCache();
+  if (c.items[lv]) return;
+  const p = generate(lv);
+  c.items[lv] = { r: Array.from(p.reg).join(""), s: p.col.join("") };
+  for (const k of Object.keys(c.items)) if (+k !== lv && +k !== level) delete c.items[k];
+  store.set("cache", JSON.stringify(c));
+}
+
+// ---------- level state ----------
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+let n, reg, sol, colours, cells, clash, undoStack, state, wonAt, dirty = true;
+// cells: 0 empty, 1 leaf, 2 opossum
+
+function newLevel(lv) {
+  level = lv;
+  lvlLabel.textContent = lv + " / " + TOTAL;
+  const p = puzzleFor(lv);
+  n = p.n; reg = p.reg; sol = p.col;
+  colours = paintRegions(lv);
+  cells = new Uint8Array(n * n); undoStack = [];
+  try {
+    const b = JSON.parse(store.get("board"));
+    if (b && b.lv === lv && b.c && b.c.length === n * n) cells = Uint8Array.from(b.c, ch => +ch);
+  } catch (e) {}
+  state = "play"; wonAt = 0;
+  endBox.classList.add("hidden"); tools.classList.remove("gone");
+  rulesText.classList.toggle("hidden", lv !== 1);
+  rulesBtn.classList.toggle("gone", lv === 1);
+  layout();
+  check(false);
+  setTimeout(() => cacheAhead(lv + 1), 600);
+}
+
+// colours: regions that touch get colours far apart on the colour wheel (the palette runs round the wheel)
+function paintRegions(lv) {
+  seed = seedFor(lv) ^ 0x5bd1e995;
+  const near = Array.from({ length: n }, () => new Set());
+  for (let i = 0; i < n * n; i++) {
+    const x = i % n;
+    if (x < n - 1 && reg[i] !== reg[i + 1]) { near[reg[i]].add(reg[i + 1]); near[reg[i + 1]].add(reg[i]); }
+    if (i + n < n * n && reg[i] !== reg[i + n]) { near[reg[i]].add(reg[i + n]); near[reg[i + n]].add(reg[i]); }
+  }
+  const L = REGION.length, pick = new Array(n).fill(-1), free = shuffle([...Array(L).keys()]);
+  const order = shuffle([...Array(n).keys()]).sort((a, b) => near[b].size - near[a].size);
+  for (const g of order) {
+    let best = free[0], bd = -1;
+    for (const k of free) {
+      let d = L;
+      for (const h of near[g]) if (pick[h] >= 0) { const e = Math.abs(k - pick[h]); d = Math.min(d, e, L - e); }
+      if (d > bd) { bd = d; best = k; }
+    }
+    pick[g] = best; free.splice(free.indexOf(best), 1);
+  }
+  return pick.map(k => REGION[k]);
+}
+
+// ---------- rules check ----------
+// clash, per cell: bit 1 = on a row, column or region that cannot work out, bit 2 = an opossum in a clash
+function check(fresh) {
+  clash = new Uint8Array(n * n);
+  const lines = [];
+  for (let r = 0; r < n; r++) { const a = [], b = []; for (let c = 0; c < n; c++) { a.push(r * n + c); b.push(c * n + r); } lines.push(a, b); }
+  for (let g = 0; g < n; g++) { const a = []; for (let i = 0; i < n * n; i++) if (reg[i] === g) a.push(i); lines.push(a); }
+  let count = 0, bad = false;
+  for (const line of lines) {
+    const pos = line.filter(i => cells[i] === 2);
+    const full = pos.length === 0 && line.every(i => cells[i] === 1);   // every cell has a leaf: no room left
+    if (pos.length > 1 || full) {
+      bad = true;
+      for (const i of line) clash[i] |= 1;
+      for (const i of pos) clash[i] |= 2;
+    }
+  }
+  for (let i = 0; i < n * n; i++) {
+    if (cells[i] !== 2) continue;
+    count++;
+    const x = i % n, y = (i / n) | 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if ((dx || dy) && nx >= 0 && ny >= 0 && nx < n && ny < n && cells[ny * n + nx] === 2) { clash[i] |= 2; bad = true; }
+    }
+  }
+  dirty = true;
+  if (fresh) store.set("board", JSON.stringify({ lv: level, c: Array.from(cells).join("") }));
+  if (count === n && !bad && state === "play") {
+    state = "won"; wonAt = performance.now();
+    saved.set(level % TOTAL + 1);                           // progress is kept the moment the level is done
+    setTimeout(() => { if (state === "won") { endBox.classList.remove("hidden"); tools.classList.add("gone"); nextBtn.focus({ preventScroll: true }); } }, calm.matches ? 300 : 1400);
+  }
+}
+
+// ---------- moves ----------
+function change(list) {          // list of [cell, new value]; one undo step
+  const step = [];
+  for (const [i, v] of list) if (cells[i] !== v) { step.push([i, cells[i]]); cells[i] = v; }
+  if (!step.length) return;
+  undoStack.push(step); if (undoStack.length > 400) undoStack.shift();
+  check(true);
+}
+const tapCell = i => change([[i, (cells[i] + 1) % 3]]);   // empty → leaf → opossum → empty
+function undo() {
+  if (state !== "play" || !undoStack.length) return;
+  for (const [i, v] of undoStack.pop().reverse()) cells[i] = v;
+  check(true);
+}
+
+// ---------- layout ----------
+let W, H, dpr, cs, gx, gy;
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = W + "px"; cv.style.height = H + "px";
+  const top = 44, bottom = rulesText.classList.contains("hidden") ? 92 : 172;
+  cs = Math.floor(Math.min((W - 24) / n, (H - top - bottom) / n, 76));
+  const size = cs * n;
+  gx = Math.round((W - size) / 2);
+  gy = Math.round(top + Math.max(0, (H - top - bottom - size) * 0.4));
+  const below = gy + size + 14;
+  rulesText.style.left = gx + "px"; rulesText.style.width = size + "px"; rulesText.style.top = below + "px";
+  const toolsTop = below + (rulesText.classList.contains("hidden") ? 0 : rulesText.offsetHeight + 8);
+  tools.style.left = (gx - 4) + "px"; tools.style.width = (size + 8) + "px"; tools.style.top = toolsTop + "px";
+  endBox.style.top = toolsTop + "px";
+  dirty = true;
+}
+
+// ---------- drawing ----------
+function sprite(m, cx, cy, px, alpha) {   // a pixel picture centred on (cx, cy), px device pixels per pixel
+  const w = m[0].length * px, h = m.length * px, x0 = Math.round(cx * dpr - w / 2), y0 = Math.round(cy * dpr - h / 2);
+  ctx.globalAlpha = alpha;
+  for (let y = 0; y < m.length; y++) for (let x = 0; x < m[y].length; x++) {
+    const ch = m[y][x]; if (ch === ".") continue;
+    ctx.fillStyle = SPR[ch]; ctx.fillRect(x0 + x * px, y0 + y * px, px, px);
+  }
+  ctx.globalAlpha = 1;
+}
+function draw(now) {
+  dirty = false;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = NIGHT; ctx.fillRect(0, 0, W, H);
+  const size = cs * n, line = Math.max(2, Math.round(cs * 0.055));
+  // cells
+  for (let i = 0; i < n * n; i++) {
+    const x = gx + (i % n) * cs, y = gy + ((i / n) | 0) * cs;
+    ctx.fillStyle = colours[reg[i]]; ctx.fillRect(x, y, cs, cs);
+    if (clash[i] & 1) {                 // soft stripes on a line or region that does not work out
+      ctx.save(); ctx.beginPath(); ctx.rect(x, y, cs, cs); ctx.clip();
+      ctx.strokeStyle = CLASH; ctx.globalAlpha = 0.45; ctx.lineWidth = Math.max(2, cs * 0.06); ctx.beginPath();
+      for (let d = -cs; d < cs * 2; d += cs / 4) {
+        const ox = ((x + y) % (cs / 4));                     // stripes line up from cell to cell
+        ctx.moveTo(x + d - ox, y + cs); ctx.lineTo(x + d - ox + cs, y);
+      }
+      ctx.stroke(); ctx.restore();
+    }
+  }
+  // thin lines between cells, thick lines between regions
+  ctx.fillStyle = "rgba(22,27,46,0.28)";
+  for (let k = 1; k < n; k++) { ctx.fillRect(gx + k * cs - 0.5, gy, 1, size); ctx.fillRect(gx, gy + k * cs - 0.5, size, 1); }
+  ctx.fillStyle = NIGHT;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const i = y * n + x;
+    if (x < n - 1 && reg[i] !== reg[i + 1]) ctx.fillRect(gx + (x + 1) * cs - line / 2, gy + y * cs - line / 2, line, cs + line);
+    if (y < n - 1 && reg[i] !== reg[i + n]) ctx.fillRect(gx + x * cs - line / 2, gy + (y + 1) * cs - line / 2, cs + line, line);
+  }
+  ctx.strokeStyle = NIGHT; ctx.lineWidth = line * 2;
+  ctx.beginPath(); ctx.roundRect ? ctx.roundRect(gx - line, gy - line, size + line * 2, size + line * 2, line * 2.5) : ctx.rect(gx - line, gy - line, size + line * 2, size + line * 2);
+  ctx.stroke();
+  // leaves and opossums, drawn in device pixels so the pixel art stays crisp
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const big = Math.max(1, Math.floor(cs * dpr * 0.8 / 16)), small = Math.max(1, Math.floor(cs * dpr * 0.36 / 7));
+  const t = state === "won" ? (now - wonAt) / 1000 : 0;
+  for (let i = 0; i < n * n; i++) {
+    const cx = gx + (i % n + 0.5) * cs, cy = gy + (((i / n) | 0) + 0.5) * cs;
+    if (cells[i] === 1) sprite(LEAF, cx, cy, small, calm.matches && t > 0 ? 0 : Math.max(0, 1 - t / 0.8));   // leaves blow away when done
+    if (cells[i] !== 2) continue;
+    if (clash[i] & 2) {                                      // a soft halo on opossums that disagree
+      ctx.fillStyle = CLASH; ctx.globalAlpha = 0.6;
+      ctx.beginPath(); ctx.arc(cx * dpr, cy * dpr, cs * dpr * 0.44, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+    }
+    if (state !== "won") { sprite(AWAKE, cx, cy, big, 1); continue; }
+    // done: one by one, row after row, each opossum curls up and falls asleep
+    const row = (i / n) | 0, k = calm.matches ? 1 : Math.min(1, Math.max(0, (t - row * 0.08) / 0.5));
+    if (k < 1) sprite(AWAKE, cx, cy, big, 1 - k);
+    if (k > 0) sprite(ASLEEP, cx, cy, big, k);
+    if (k === 1) {                                           // a slow "z" drifts up from each sleeper
+      const zp = Math.max(1, Math.round(big * 0.7)), phase = calm.matches ? 0.35 : ((t - row * 0.08 - 0.5) / 3.2 + (i % 5) * 0.21) % 1;
+      if (phase >= 0) sprite(ZED, cx + cs * (0.2 + phase * 0.1), cy - cs * (0.16 + phase * 0.2), zp, calm.matches ? 0.8 : Math.sin(phase * Math.PI) * 0.9);
+    }
+  }
+}
+
+// ---------- input: tap to cycle a cell, drag to lay (or lift) leaves ----------
+let press = null;
+function cellAt(x, y) {
+  const cx = Math.floor((x - gx) / cs), cy = Math.floor((y - gy) / cs);
+  return cx >= 0 && cy >= 0 && cx < n && cy < n ? cy * n + cx : -1;
+}
+cv.addEventListener("pointerdown", e => {
+  if (state !== "play" || press) return;
+  const i = cellAt(e.clientX, e.clientY); if (i < 0) return;
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+  press = { id: e.pointerId, start: i, last: i, moved: false, mode: cells[i] === 1 ? 0 : 1, list: [] };
+});
+cv.addEventListener("pointermove", e => {
+  if (!press || e.pointerId !== press.id) return;
+  const i = cellAt(e.clientX, e.clientY);
+  if (i < 0 || i === press.last) return;
+  if (!press.moved) { press.moved = true; paint(press.start); }
+  // fill in the cells crossed between two pointer events
+  const ax = press.last % n, ay = (press.last / n) | 0, bx = i % n, by = (i / n) | 0, steps = Math.max(Math.abs(bx - ax), Math.abs(by - ay));
+  for (let s = 1; s <= steps; s++) paint(Math.round(ay + (by - ay) * s / steps) * n + Math.round(ax + (bx - ax) * s / steps));
+  press.last = i;
+});
+function paint(i) {              // during a drag: leaves on empty cells (or off leafy cells); opossums stay put
+  const want = press.mode, have = cells[i];
+  if ((want === 1 && have === 0) || (want === 0 && have === 1)) { press.list.push([i, have]); cells[i] = want; check(false); }
+}
+function release(e) {
+  if (!press || e.pointerId !== press.id) return;
+  const p = press; press = null;
+  if (!p.moved) { tapCell(p.start); return; }
+  if (p.list.length) {           // the whole drag is one undo step
+    undoStack.push(p.list); if (undoStack.length > 400) undoStack.shift();
+    check(true);
+  }
+}
+cv.addEventListener("pointerup", release);
+cv.addEventListener("pointercancel", release);
+undoBtn.addEventListener("click", undo);
+rulesBtn.addEventListener("click", () => { rulesText.classList.toggle("hidden"); layout(); });
+nextBtn.addEventListener("click", () => newLevel(level % TOTAL + 1));
+addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key === "z") { e.preventDefault(); undo(); } });
+
+// ---------- loop: about 30 frames a second, and only while something changes ----------
+let last = 0;
+function frame(t) {
+  if (t - last >= 30) {
+    last = t;
+    const moving = state === "won" && !calm.matches;
+    if (dirty || moving || (state === "won" && t - wonAt < 1200)) draw(t);
+  }
+  requestAnimationFrame(frame);
+}
+addEventListener("resize", () => { layout(); });
+calm.addEventListener && calm.addEventListener("change", () => { dirty = true; });
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>

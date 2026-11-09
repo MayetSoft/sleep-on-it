@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1c1512">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Embers</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #1c1512; overflow: hidden;
+    touch-action: manipulation; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; }
+  button { font: 15px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em;
+    color: #f0dcc6; background: #2a1d17; border: 1px solid #7a5644; border-radius: 6px;
+    width: 128px; padding: 15px 0; cursor: pointer; }
+  button:active { background: #21160f; }
+  button:focus-visible { outline: 2px solid #f0dcc6; outline-offset: 3px; }
+  button.quiet { color: #a8907c; border-color: #4e3a2f; }
+  #home { position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 12px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #a8907c; text-decoration: none; }
+  #home:focus-visible { outline: 2px solid #f0dcc6; outline-offset: 3px; }
+  #lvl { position: fixed; height: 28px; font: 13px/28px ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .08em; color: #c4ab94; }
+  #speed { position: fixed; width: auto; min-width: 44px; height: 28px; padding: 0 12px; font-size: 13px; }
+  #speed::before { content: ""; position: absolute; inset: -8px; }
+  #act { position: fixed; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="lvl"></div>
+<button id="speed">1×</button>
+<button id="act">breathe</button>
+<script>
+"use strict";
+// ---------- settings ----------
+const TOTAL = 300;          // distinct levels
+const CAP = 80;             // a run lasts at most this many generations (56 s at 1×)
+const GEN_TIME = 0.7;       // seconds per generation at 1×
+const AUTO = 3;             // seconds of quiet after the last spark before the fire breathes on its own
+const COOL = 1.3;           // cooling time constant, seconds
+const ASH = 0.16;           // the faint trail left where life has been
+const BG = "#1c1512";
+// heat ramp: dark cell, ash, dark red, red, orange, hot
+const RAMP = [[0, [40, 30, 25]], [0.16, [84, 40, 28]], [0.34, [132, 40, 25]], [0.56, [200, 64, 32]],
+  [0.8, [240, 120, 46]], [1, [255, 184, 100]]];
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const actBtn = document.getElementById("act");
+const speedBtn = document.getElementById("speed");
+const lvlLabel = document.getElementById("lvl");
+const SPEEDS = [1, 2, 3, 5];
+let speedIdx = 0;
+const still = matchMedia("(prefers-reduced-motion: reduce)");
+
+// ---------- seeded random ----------
+let seed = 0;
+function rnd() { // mulberry32
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+
+// ---------- numbered levels: level n always builds the same puzzle ----------
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+const saved = {                  // progress, kept in this browser only
+  get() { try { return parseInt(localStorage.getItem("embers.level"), 10) || 1; } catch (e) { return 1; } },
+  set(n) { try { localStorage.setItem("embers.level", String(n)); } catch (e) {} },
+};
+
+// ---------- life: a G x G board with a dead border one cell wide ----------
+const pad = (G, i) => ((i / G | 0) + 1) * (G + 2) + i % G + 1;
+function lifeKey(G, a) {
+  const P = G + 2; let h1 = 0, h2 = 0x811c9dc5, n = 0;
+  for (let i = P; i < P * (G + 1); i++) if (a[i]) { n++; h1 = (Math.imul(h1, 31) + i) | 0; h2 = Math.imul(h2 ^ i, 16777619); }
+  return n + ":" + h1 + ":" + h2;
+}
+function lifeStep(G, a, b) {     // one generation from a into b; returns the new state's key
+  const P = G + 2; let h1 = 0, h2 = 0x811c9dc5, n = 0;
+  for (let y = 1; y <= G; y++) {
+    const r = y * P;
+    for (let x = 1; x <= G; x++) {
+      const i = r + x;
+      const s = a[i - P - 1] + a[i - P] + a[i - P + 1] + a[i - 1] + a[i + 1] + a[i + P - 1] + a[i + P] + a[i + P + 1];
+      const v = s === 3 || (s === 2 && a[i]) ? 1 : 0;
+      b[i] = v;
+      if (v) { n++; h1 = (Math.imul(h1, 31) + i) | 0; h2 = Math.imul(h2 ^ i, 16777619); }
+    }
+  }
+  return n + ":" + h1 + ":" + h2;
+}
+// a whole run: the generation each cell first came alive (-1 = never). It ends at CAP or
+// when the board repeats an earlier state, since nothing new can light after that.
+function lifeRun(G, cells) {
+  const P = G + 2; let a = new Uint8Array(P * P), b = new Uint8Array(P * P);
+  const first = new Int16Array(G * G).fill(-1);
+  for (const i of cells) { a[pad(G, i)] = 1; first[i] = 0; }
+  const seen = new Set([lifeKey(G, a)]);
+  for (let g = 1; g <= CAP; g++) {
+    const k = lifeStep(G, a, b); [a, b] = [b, a];
+    for (let y = 0; y < G; y++) for (let x = 0; x < G; x++)
+      if (a[(y + 1) * P + x + 1] && first[y * G + x] < 0) first[y * G + x] = g;
+    if (seen.has(k)) break;
+    seen.add(k);
+  }
+  return first;
+}
+
+// ---------- level generation: sparks are thrown at random, targets are chosen among cells they lit ----------
+function params(n) {
+  const t = (n - 1) / (TOTAL - 1);
+  const hard = n > 4 && n % 5 === 0;                     // every 5th level asks a little more
+  const G = Math.min(18, 11 + Math.round(t * 7) + (hard ? 1 : 0));
+  const z = n <= 10 ? 3 : n <= 80 ? 4 : 5;               // the spark zone is z x z (sometimes one wider)
+  const k = n <= 10 ? 5 : n <= 40 ? 6 : n <= 80 ? 7 : n <= 160 ? 8 : n <= 240 ? 9 : 10;
+  let T = n <= 3 ? 1 : n <= 15 ? 2 : Math.min(5, 2 + Math.floor(t * 3.4));
+  if (hard) T = Math.min(6, T + 1);
+  let pmin = 0.25 - 0.18 * t;                            // share of random spark sets that solve it
+  if (hard) pmin *= 0.6;
+  if (z === 3 && T > 1) pmin *= 0.65;                    // few spark sets fit a small zone
+  const spread = 1 + t * 2 + (hard ? 1 : 0);             // how much far-away targets are preferred
+  return { G, z, k, T, pmin, pmax: 0.6 - 0.3 * t, spread, hard };
+}
+
+function combos(list, k) {
+  const out = [], cur = [];
+  (function rec(s) {
+    if (cur.length === k) { out.push(cur.slice()); return; }
+    for (let i = s; i <= list.length - (k - cur.length); i++) { cur.push(list[i]); rec(i + 1); cur.pop(); }
+  })(0);
+  return out;
+}
+function choose(n, k) { let r = 1; for (let i = 0; i < k; i++) r = r * (n - i) / (i + 1); return r; }
+
+function tryLevel(p, relax) {
+  const { G, z, k } = p;
+  const zw = z + (p.G >= 16 && rnd() < 0.4 ? 1 : 0), zh = z;
+  const zx = ri(2, G - zw - 2), zy = ri(2, G - zh - 2);
+  const zone = [];
+  for (let y = zy; y < zy + zh; y++) for (let x = zx; x < zx + zw; x++) zone.push(y * G + x);
+  // the spark sets tried: all of them when there are few, otherwise a random sample
+  let sets;
+  if (choose(zone.length, k) <= 400) sets = combos(zone, k);
+  else {
+    const keys = new Set(); sets = [];
+    while (sets.length < 160) {
+      const pool = zone.slice(), s = [];
+      for (let j = 0; j < k; j++) s.push(pool.splice(ri(0, pool.length - 1), 1)[0]);
+      s.sort((a, b) => a - b);
+      const key = s.join(",");
+      if (!keys.has(key)) { keys.add(key); sets.push(s); }
+    }
+  }
+  const runs = sets.map(s => lifeRun(G, s)), M = runs.length;
+  const LATE = CAP - 12;                                 // targets light up well before the run's end
+  const dz = new Int8Array(G * G), freq = new Float32Array(G * G);
+  for (let i = 0; i < G * G; i++) {
+    const x = i % G, y = i / G | 0;
+    dz[i] = Math.max(zx - x, x - (zx + zw - 1), zy - y, y - (zy + zh - 1), 0);
+    let f = 0; for (const r of runs) if (r[i] >= 0 && r[i] <= LATE) f++;
+    freq[i] = f / M;
+  }
+  // the generating spark set: one of those that reached furthest
+  const reach = runs.map(r => { let v = 0; for (let i = 0; i < G * G; i++) if (r[i] >= 0 && r[i] <= LATE && dz[i] >= 1) v += Math.min(dz[i], 4); return v; });
+  const order = runs.map((r, i) => i).filter(i => reach[i] > 0).sort((a, b) => reach[b] - reach[a]);
+  if (!order.length) return null;
+  const pick = order[ri(0, Math.max(0, Math.floor(order.length * 0.3) - 1))];
+  const sol = runs[pick];
+  const cands = [];
+  for (let i = 0; i < G * G; i++) if (dz[i] >= 1 && sol[i] >= 1 && sol[i] <= LATE) cands.push(i);
+  const need = Math.max(2, Math.ceil(p.pmin * relax * M));
+  let ok = runs.map((r, i) => i);                         // spark sets that still light every chosen target
+  const chosen = [];
+  const cheb = (a, b) => Math.max(Math.abs(a % G - b % G), Math.abs((a / G | 0) - (b / G | 0)));
+  const addOne = (wantLower) => {
+    const scored = cands.filter(i => !chosen.includes(i) && chosen.every(j => cheb(i, j) >= 2)).map(i => {
+      const sp = chosen.length ? Math.min(...chosen.map(j => cheb(i, j))) : 4;
+      return [i, Math.min(dz[i], 5) * 0.4 * p.spread + Math.min(sp, 5) * 0.6 + (1 - freq[i]) * p.spread + rnd() * 1.6];
+    }).sort((a, b) => b[1] - a[1]);
+    for (const [i] of scored) {
+      const nk = ok.filter(s => runs[s][i] >= 0 && runs[s][i] <= LATE);
+      if (nk.length < need || (wantLower && nk.length === ok.length)) continue;
+      chosen.push(i); ok = nk; return true;
+    }
+    return false;
+  };
+  while (chosen.length < p.T && addOne(false));
+  if (chosen.length < Math.max(1, relax < 1 ? p.T - 1 : p.T)) return null;
+  while (ok.length / M > p.pmax && chosen.length < 6 && addOne(true));
+  return { G, zone: { x: zx, y: zy, w: zw, h: zh }, k, targets: chosen, sol: sets[pick], share: ok.length / M,
+    winGen: Math.max(...chosen.map(i => sol[i])) };
+}
+
+function makeLevel(n) {
+  seed = seedFor(n);
+  const p = params(n);
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const L = tryLevel(p, attempt < 8 ? 1 : attempt < 20 ? 0.7 : attempt < 40 ? 0.45 : 0.3);
+    if (L) return L;
+  }
+  return tryLevel({ ...p, T: 1, pmin: 0 }, 1);
+}
+
+// ---------- level state ----------
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+let L, G, sparks, live, heat, ever, burn, hit, state, gen, genT, seen, simA, simB, endTimer, autoT = 0, nudge = 0, zoneNudge = 0;
+
+let ahead = null;                // the next level, built while the finished one is on screen
+function newLevel(n) {
+  level = n;
+  lvlLabel.textContent = n + " / " + TOTAL;
+  L = ahead && ahead.n === n ? ahead.L : makeLevel(n); G = L.G; ahead = null;
+  sparks = new Set();
+  live = new Uint8Array(G * G); heat = new Float32Array(G * G); ever = new Uint8Array(G * G); burn = new Uint8Array(G * G);
+  hit = new Uint8Array(L.targets.length);
+  layout();
+  toEdit();
+}
+
+function toEdit() {
+  state = "edit"; autoT = 0; gen = 0;
+  live.fill(0); ever.fill(0); burn.fill(0); hit.fill(0);
+  for (const i of sparks) live[i] = 1;
+  setButton();
+}
+
+function breathe() {
+  if (!sparks.size) { nudge = 1; return; }
+  state = "run"; autoT = 0; gen = 0; genT = GEN_TIME * 0.4;
+  const P = G + 2; simA = new Uint8Array(P * P); simB = new Uint8Array(P * P);
+  for (const i of sparks) { simA[pad(G, i)] = 1; ever[i] = 1; }
+  seen = new Set([lifeKey(G, simA)]);
+  setButton();
+}
+
+function tick() {                // one generation, the same rules as lifeRun
+  const k = lifeStep(G, simA, simB); [simA, simB] = [simB, simA]; gen++;
+  const P = G + 2;
+  for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
+    const v = simA[(y + 1) * P + x + 1], i = y * G + x; live[i] = v; if (v) { ever[i] = 1; if (burn[i] < 255) burn[i]++; }
+  }
+  L.targets.forEach((t, j) => { if (live[t]) hit[j] = 1; });
+  if (hit.every(h => h)) { finish("won"); return; }
+  if (seen.has(k) || gen >= CAP) { finish("ended"); return; }
+  seen.add(k);
+}
+
+function finish(s) {             // the fire settles: living cells start to cool
+  state = s; endTimer = 0; live.fill(0);
+  if (s === "won") {
+    const n = level % TOTAL + 1; saved.set(n);
+    setTimeout(() => { if (state === "won" && !ahead) ahead = { n, L: makeLevel(n) }; }, 60);
+  }
+  setButton();
+}
+
+function setButton() {
+  actBtn.style.background = "";
+  actBtn.classList.toggle("hidden", state === "won");
+  actBtn.textContent = { edit: "breathe", run: "stop", ended: "again", won: "next" }[state];
+  actBtn.classList.toggle("quiet", state === "edit" && !sparks.size);
+}
+
+// ---------- layout ----------
+let W, H, dpr, c, ox, oy, glow;
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = window.devicePixelRatio || 1;
+  cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px";
+  c = Math.max(8, Math.min(42, Math.floor(Math.min((W - 24) / G, (H - 48 - 176) / G))));
+  const B = G * c, total = B + 156;
+  ox = Math.round((W - B) / 2); oy = Math.max(44, Math.round((H - total) / 2));
+  const rowY = oy + B + 14;
+  lvlLabel.style.top = rowY + "px"; lvlLabel.style.left = ox + "px";
+  speedBtn.style.top = rowY + "px"; speedBtn.style.right = (W - ox - B) + "px";
+  actBtn.style.top = (rowY + 28 + 52) + "px"; actBtn.style.left = Math.round(W / 2 - 64) + "px";
+  glow = document.createElement("canvas");                    // one soft glow, reused for every hot cell
+  const gs = Math.max(16, Math.round(c * 3 * dpr)); glow.width = glow.height = gs;
+  const g = glow.getContext("2d"), rg = g.createRadialGradient(gs / 2, gs / 2, 0, gs / 2, gs / 2, gs / 2);
+  rg.addColorStop(0, "rgba(255,150,60,0.55)"); rg.addColorStop(0.35, "rgba(240,100,40,0.22)"); rg.addColorStop(1, "rgba(200,60,20,0)");
+  g.fillStyle = rg; g.fillRect(0, 0, gs, gs);
+}
+const dotsY = () => oy + G * c + 14 + 28 + 26;
+
+// ---------- update ----------
+function update(dt) {             // simulated time: runs several times a frame at higher speeds
+  const fade = Math.exp(-dt / COOL);
+  for (let i = 0; i < G * G; i++) {
+    if (live[i]) heat[i] += (1 - heat[i]) * Math.min(1, dt * 8);
+    else heat[i] = Math.max(ever[i] ? ASH * (0.75 + 0.5 * Math.min(1, burn[i] / 8)) : 0, heat[i] * fade - (ever[i] ? 0 : dt * 0.02));
+  }
+  if (state === "run" && (genT -= dt) <= 0) { genT += GEN_TIME; tick(); }
+  if (state === "won" && (endTimer += dt) > 0.8 && actBtn.classList.contains("hidden")) actBtn.classList.remove("hidden");
+}
+function realTick(dt) {           // real time: the quiet before the fire breathes on its own
+  nudge = Math.max(0, nudge - dt * 1.4); zoneNudge = Math.max(0, zoneNudge - dt * 1.4);
+  if (state === "edit" && autoT > 0) {
+    autoT -= dt;
+    const p = Math.round(100 * (1 - Math.max(0, autoT) / AUTO));
+    actBtn.style.background = `linear-gradient(90deg, #4a2c1e ${p}%, #2a1d17 ${p}%)`;
+    if (autoT <= 0) breathe();
+  }
+}
+
+// ---------- drawing ----------
+function heatColor(h) {
+  for (let j = 1; j < RAMP.length; j++) if (h <= RAMP[j][0]) {
+    const [h0, a] = RAMP[j - 1], [h1, b] = RAMP[j], u = (h - h0) / (h1 - h0);
+    return `rgb(${a[0] + (b[0] - a[0]) * u | 0},${a[1] + (b[1] - a[1]) * u | 0},${a[2] + (b[2] - a[2]) * u | 0})`;
+  }
+  return "rgb(255,184,100)";
+}
+function draw(time) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  const gap = Math.max(1, Math.round(c * 0.08)), Z = L.zone;
+  // the zone where sparks may go
+  const zoneA = state === "edit" || state === "ended" ? 1 : 0.45;
+  ctx.fillStyle = `rgba(120,82,56,${0.32 * zoneA})`;
+  ctx.fillRect(ox + Z.x * c - gap, oy + Z.y * c - gap, Z.w * c + gap, Z.h * c + gap);
+  const flick = !still.matches;
+  for (let i = 0; i < G * G; i++) {
+    let h = heat[i];
+    if (flick && live[i] && state === "run") h *= 0.94 + 0.06 * Math.sin(time * 5.3 + i * 2.17);
+    ctx.fillStyle = heatColor(h);
+    ctx.fillRect(ox + (i % G) * c, oy + (i / G | 0) * c, c - gap, c - gap);
+  }
+  ctx.strokeStyle = `rgba(232,172,118,${Math.min(1, 0.42 * zoneA + 0.5 * zoneNudge)})`; ctx.lineWidth = 1.5 + zoneNudge;
+  ctx.strokeRect(ox + Z.x * c - gap * 1.5 - 1, oy + Z.y * c - gap * 1.5 - 1, Z.w * c + gap * 2 + 2, Z.h * c + gap * 2 + 2);
+  // soft glow on hot cells
+  ctx.globalCompositeOperation = "lighter";
+  const gs = c * 3;
+  for (let i = 0; i < G * G; i++) {
+    const h = heat[i]; if (h < 0.4) continue;
+    ctx.globalAlpha = Math.min(1, (h - 0.4) / 0.6) * 0.8;
+    ctx.drawImage(glow, ox + (i % G + 0.5) * c - gap / 2 - gs / 2, oy + ((i / G | 0) + 0.5) * c - gap / 2 - gs / 2, gs, gs);
+  }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+  // targets: a faint ring, bright once life has touched it
+  L.targets.forEach((t, j) => {
+    const x = ox + (t % G + 0.5) * c - gap / 2, y = oy + ((t / G | 0) + 0.5) * c - gap / 2, r = c * 0.3;
+    const lw = Math.max(1.5, c * (hit[j] ? 0.11 : 0.07));
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+    ctx.strokeStyle = "rgba(24,12,8,0.55)"; ctx.lineWidth = lw + 2.5; ctx.stroke();
+    ctx.strokeStyle = hit[j] ? "#ffe9bf" : "rgba(246,212,170,0.62)"; ctx.lineWidth = lw; ctx.stroke();
+    if (hit[j] && heat[t] < 0.5) { ctx.beginPath(); ctx.arc(x, y, c * 0.1, 0, 7); ctx.fillStyle = "#ffe9bf"; ctx.fill(); }
+  });
+  // sparks left to place
+  const n = L.k, left = n - sparks.size, sz = 10, sp = 10, x0 = W / 2 - (n * sz + (n - 1) * sp) / 2, y = dotsY();
+  for (let j = 0; j < n; j++) {
+    const x = x0 + j * (sz + sp);
+    if (j < left) {
+      ctx.fillStyle = nudge > 0 ? heatColor(0.8 + 0.2 * nudge) : "#f0904a"; ctx.fillRect(x, y - sz / 2, sz, sz);
+    } else { ctx.strokeStyle = nudge > 0 ? heatColor(0.3 + 0.5 * nudge) : "#6a4a3a"; ctx.lineWidth = 1.5; ctx.strokeRect(x + 0.75, y - sz / 2 + 0.75, sz - 1.5, sz - 1.5); }
+  }
+}
+
+// ---------- input ----------
+function cellAt(px, py) {
+  const x = Math.floor((px - ox) / c), y = Math.floor((py - oy) / c);
+  return x < 0 || y < 0 || x >= G || y >= G ? -1 : y * G + x;
+}
+function inZone(i) { const Z = L.zone, x = i % G, y = i / G | 0; return x >= Z.x && x < Z.x + Z.w && y >= Z.y && y < Z.y + Z.h; }
+function toggle(i) {             // a spark on or off; the fire breathes on its own a moment after the last one
+  if (state !== "edit" && state !== "ended") return false;
+  if (!inZone(i)) { zoneNudge = 1; return false; }               // sparks go inside the outlined zone
+  if (state === "ended") toEdit();                               // a new try starts from the same sparks
+  if (sparks.has(i)) { sparks.delete(i); live[i] = 0; autoT = 0; }
+  else if (sparks.size < L.k) { sparks.add(i); live[i] = 1; autoT = sparks.size === L.k ? AUTO : 0; }
+  else { nudge = 1; autoT = 0; actBtn.style.background = ""; return false; }
+  setButton();
+  return true;
+}
+cv.addEventListener("pointerdown", e => {
+  const fx = (e.clientX - ox) / c, fy = (e.clientY - oy) / c, Z = L.zone, m = 0.6;
+  if (fx > Z.x - m && fx < Z.x + Z.w + m && fy > Z.y - m && fy < Z.y + Z.h + m) {   // taps just off the zone edge count
+    const x = Math.min(Z.x + Z.w - 1, Math.max(Z.x, Math.floor(fx))), y = Math.min(Z.y + Z.h - 1, Math.max(Z.y, Math.floor(fy)));
+    toggle(y * G + x); return;
+  }
+  const i = cellAt(e.clientX, e.clientY);
+  if (i >= 0) toggle(i);
+});
+actBtn.addEventListener("click", () => {
+  if (state === "edit") breathe();
+  else if (state === "run" || state === "ended") toEdit();
+  else if (state === "won") newLevel(level % TOTAL + 1);
+});
+
+// ---------- loop ----------
+let last = 0;
+function frame(t) {
+  const dt = Math.min(0.05, (t - last) / 1000);
+  if (t - last >= 30) {                                     // about 30 frames a second is plenty
+    last = t;
+    realTick(dt);
+    for (let i = 0; i < SPEEDS[speedIdx]; i++) update(dt);   // faster = more steps per frame, same rules
+    draw(t / 1000);
+  }
+  requestAnimationFrame(frame);
+}
+speedBtn.addEventListener("click", () => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  speedBtn.textContent = SPEEDS[speedIdx] + "×";
+});
+addEventListener("resize", () => { layout(); });
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>

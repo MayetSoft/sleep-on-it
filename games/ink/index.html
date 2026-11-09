@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#070d18">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Ink</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #070d18; overflow: hidden;
+    touch-action: manipulation; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; }
+  button { font: 15px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em;
+    color: #d6e2f2; background: #0f1a2b; border: 1px solid #34506f; border-radius: 6px;
+    width: 104px; height: 46px; padding: 0; cursor: pointer; }
+  button:active { background: #0a1220; }
+  button:focus-visible { outline: 2px solid #d6e2f2; outline-offset: 2px; }
+  button:disabled { opacity: .4; cursor: default; }
+  #home { position: fixed; top: calc(-2px + env(safe-area-inset-top)); left: 0; padding: 10px 12px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #8fa3c0; text-decoration: none; }
+  #home:focus-visible { outline: 2px solid #d6e2f2; outline-offset: -4px; }
+  #lvl { position: fixed; height: 28px; line-height: 28px; font: 13px ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .08em; color: #9fb2cc; }
+  #speed { position: fixed; width: 56px; height: 44px; font-size: 13px; }
+  #undo, #empty { position: fixed; width: 96px; }
+  #end { position: fixed; left: 0; right: 0; display: flex; justify-content: center; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="lvl"></div>
+<button id="speed">1×</button>
+<button id="undo">undo</button>
+<button id="empty">empty</button>
+<div id="end" class="hidden"><button id="next">next</button></div>
+<script>
+"use strict";
+// ---------- settings ----------
+const NX = 48, NY = 64, N = NX * NY;   // the water is a grid of NX x NY cells
+const STEPS = 270;         // a drop blooms for 270 steps, then rests
+const RATE = 30;           // steps per second at 1×: a drop blooms for 9 seconds
+const MASS = 100;          // ink in one drop
+const K = 2.4;             // how strongly ink colours the water
+const FLOW = 0.12, TF = 100;   // the slow current: strength, and how fast it calms down (in steps)
+const SINK = 0.2, TS = 14;     // a new drop sinks a little, then floats
+const D0 = 0.03, D1 = 0.05, TD = 25; // spreading: a burst when the drop lands, then a slow bloom
+const TOTAL = 200;
+const BG = "#070d18";
+// ink colours: red, yellow, blue mix like paint; milk lightens
+const NAMES = ["red", "yellow", "blue", "milk"];
+const RYB = {               // corners of the paint-mixing cube [red, yellow, blue]
+  "100": [234, 78, 88], "010": [246, 208, 74], "001": [72, 138, 244],
+  "110": [246, 142, 62], "011": [76, 192, 112], "101": [156, 88, 210], "111": [150, 112, 92],
+};
+const MILK = [232, 236, 242];
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const endBox = document.getElementById("end");
+const nextBtn = document.getElementById("next");
+const speedBtn = document.getElementById("speed");
+const undoBtn = document.getElementById("undo");
+const emptyBtn = document.getElementById("empty");
+const lvlLabel = document.getElementById("lvl");
+const SPEEDS = [1, 2, 3, 5];
+let speedIdx = 0;
+const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// ---------- seeded random ----------
+let seed = 0;
+function rnd() { // mulberry32
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+
+// ---------- numbered levels: level n always builds the same puzzle ----------
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+const saved = {                  // progress, kept in this browser only
+  get() { try { return parseInt(localStorage.getItem("ink.level"), 10) || 1; } catch (e) { return 1; } },
+  set(n) { try { localStorage.setItem("ink.level", String(n)); } catch (e) {} },
+};
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+
+// ---------- colour ----------
+function mix(r, y, b, w) {       // paint mixing: the share of each pigment picks a point in the RYB cube
+  const m = Math.max(r, y, b), out = [0, 0, 0];
+  if (m > 0) {
+    const R = r / m, Y = y / m, B = b / m;
+    for (const key in RYB) {
+      const wt = (key[0] === "1" ? R : 1 - R) * (key[1] === "1" ? Y : 1 - Y) * (key[2] === "1" ? B : 1 - B);
+      if (wt > 0) for (let c = 0; c < 3; c++) out[c] += RYB[key][c] * wt;
+    }
+  }
+  const wf = w / (r + y + b + w);
+  for (let c = 0; c < 3; c++) out[c] = out[c] * (1 - wf) + MILK[c] * wf;
+  return out;
+}
+const pigColour = k => mix(k === 0 ? 1 : 0, k === 1 ? 1 : 0, k === 2 ? 1 : 0, k === 3 ? 1 : 0);
+const css = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+
+// ---------- the water: a slow current that turns in the tank ----------
+// stream function on cell corners, zero on the glass; face velocities from it carry no ink through the walls
+let UF, VF;                      // UF: faces between left/right cells, VF: faces between upper/lower cells
+function buildFlow() {
+  const modes = [{ m: 1, n: 1, a: rnd() < 0.5 ? -1 : 1 }];
+  for (let e = ri(3, 5); e > 0; e--) modes.push({ m: ri(1, 5), n: ri(1, 6), a: (rnd() * 2 - 1) * 0.5 });
+  const psi = new Float64Array((NX + 1) * (NY + 1));
+  for (let y = 0; y <= NY; y++) for (let x = 0; x <= NX; x++) {
+    let v = 0;
+    for (const o of modes) v += o.a * Math.sin(o.m * Math.PI * x / NX) * Math.sin(o.n * Math.PI * y / NY);
+    psi[y * (NX + 1) + x] = v;
+  }
+  const P = (x, y) => psi[y * (NX + 1) + x];
+  UF = new Float64Array((NX + 1) * NY); VF = new Float64Array(NX * (NY + 1));
+  let mx = 1e-9;
+  for (let j = 0; j < NY; j++) for (let i = 0; i <= NX; i++) { const u = P(i, j + 1) - P(i, j); UF[j * (NX + 1) + i] = u; mx = Math.max(mx, Math.abs(u)); }
+  for (let j = 0; j <= NY; j++) for (let i = 0; i < NX; i++) { const v = -(P(i + 1, j) - P(i, j)); VF[j * NX + i] = v; mx = Math.max(mx, Math.abs(v)); }
+  for (let i = 0; i < UF.length; i++) UF[i] /= mx;
+  for (let i = 0; i < VF.length; i++) VF[i] /= mx;
+}
+
+// ---------- one drop: sinks, curls open, drifts with the current and slowly blooms ----------
+// each drop lives on its own grid and follows its own clock, so drops add up the same in any order.
+// a falling drop pushes water ahead of it: two small whirls side by side curl the ink into a cap
+const VORT = 1.4, TV = 70, SEP = 1.6, PAIR = 0.3, TP = 24;
+const U = new Float64Array((NX + 1) * NY), V = new Float64Array(NX * (NY + 1));
+const PS = new Float64Array((NX + 1) * (NY + 1)), EL = new Float64Array(NX + 1), ER = new Float64Array(NX + 1);
+function vanLeer(p, q) { return p * q > 0 ? 2 * p * q / (p + q) : 0; }
+const EPS = 1e-5;                // ink this thin is invisible: the step only works on the box around the rest
+function stepDrop(d) {
+  const age = d.age, c = d.c, t = d.t, W1 = NX + 1;
+  const f = FLOW * Math.min(1, age / 30) * Math.exp(-age / TF);
+  const vs = SINK * Math.exp(-age / TS), D = D0 + D1 * Math.exp(-age / TD);
+  const bx0 = Math.max(0, d.bx0 - 2), bx1 = Math.min(NX - 1, d.bx1 + 2), by0 = Math.max(0, d.by0 - 2), by1 = Math.min(NY - 1, d.by1 + 2);
+  for (let j = by0; j <= by1; j++) for (let i = bx0; i <= bx1 + 1; i++) U[j * W1 + i] = f * UF[j * W1 + i];
+  for (let j = by0; j <= by1 + 1; j++) for (let i = bx0; i <= bx1; i++) V[j * NX + i] = f * VF[j * NX + i] + (j > 0 && j < NY ? vs : 0);
+  const G = VORT * Math.exp(-age / TV), vp = PAIR * Math.exp(-age / TP);
+  if (age < 180) {                                  // the pair of whirls, on cell corners; they widen as they slow
+    const sg = Math.min(6, 1.4 + age * 0.05), sep = SEP + Math.min(age, 130) * 0.035, R = Math.ceil(3.5 * sg + sep), cx = d.x, cy = d.y;
+    const x0 = Math.max(bx0, Math.floor(cx - R)), x1 = Math.min(bx1 + 1, Math.ceil(cx + R));
+    const y0 = Math.max(by0, Math.floor(cy - R)), y1 = Math.min(by1 + 1, Math.ceil(cy + R));
+    if (x0 < x1 && y0 < y1) {
+      const k2 = 1 / (2 * sg * sg);
+      for (let X = x0; X <= x1; X++) { const dl = X - cx + sep, dr = X - cx - sep; EL[X] = Math.exp(-dl * dl * k2); ER[X] = Math.exp(-dr * dr * k2); }
+      for (let Y = y0; Y <= y1; Y++) {
+        const ey = Y === 0 || Y === NY ? 0 : Math.exp(-(Y - cy) * (Y - cy) * k2);
+        for (let X = x0; X <= x1; X++) PS[Y * W1 + X] = X === 0 || X === NX ? 0 : ey * (EL[X] - ER[X]);
+      }
+      let m = 1e-9;                                 // keep every face slower than the grid can carry
+      for (let j = y0; j < y1; j++) for (let i = x0; i <= x1; i++) m = Math.max(m, Math.abs(PS[(j + 1) * W1 + i] - PS[j * W1 + i]));
+      for (let j = y0; j <= y1; j++) for (let i = x0; i < x1; i++) m = Math.max(m, Math.abs(PS[j * W1 + i + 1] - PS[j * W1 + i]));
+      const g = Math.min(G, (0.9 - vs - FLOW - 4 * D) / m);
+      for (let j = y0; j < y1; j++) for (let i = x0; i <= x1; i++) U[j * W1 + i] += g * (PS[(j + 1) * W1 + i] - PS[j * W1 + i]);
+      for (let j = y0; j <= y1; j++) for (let i = x0; i < x1; i++) V[j * NX + i] -= g * (PS[j * W1 + i + 1] - PS[j * W1 + i]);
+    }
+  }
+  d.y += vp;
+  for (let j = by0; j <= by1; j++) { const r = j * NX; for (let i = bx0; i <= bx1; i++) t[r + i] = c[r + i]; }
+  for (let j = by0; j <= by1; j++) {                // across: flux-limited upwind, plus spreading
+    const row = j * NX, fr = j * W1;
+    for (let i = bx0 + 1; i <= bx1; i++) {
+      const a = row + i - 1, b = a + 1, u = U[fr + i];
+      let fl;
+      if (u > 0) { const aa = i >= 2 ? a - 1 : a; fl = u * (c[a] + 0.5 * (1 - u) * vanLeer(c[a] - c[aa], c[b] - c[a])); }
+      else { const bb = i + 1 < NX ? b + 1 : b; fl = u * (c[b] - 0.5 * (1 + u) * vanLeer(c[b] - c[a], c[bb] - c[b])); }
+      fl += D * (c[a] - c[b]);
+      t[a] -= fl; t[b] += fl;
+    }
+  }
+  for (let j = by0 + 1; j <= by1; j++) {            // down
+    const fr = j * NX;
+    for (let i = bx0; i <= bx1; i++) {
+      const a = fr - NX + i, b = fr + i, v = V[fr + i];
+      let fl;
+      if (v > 0) { const aa = j >= 2 ? a - NX : a; fl = v * (c[a] + 0.5 * (1 - v) * vanLeer(c[a] - c[aa], c[b] - c[a])); }
+      else { const bb = j + 1 < NY ? b + NX : b; fl = v * (c[b] - 0.5 * (1 + v) * vanLeer(c[b] - c[a], c[bb] - c[b])); }
+      fl += D * (c[a] - c[b]);
+      t[a] -= fl; t[b] += fl;
+    }
+  }
+  let nx0 = NX, nx1 = -1, ny0 = NY, ny1 = -1;        // the new box
+  for (let j = by0; j <= by1; j++) { const r = j * NX; for (let i = bx0; i <= bx1; i++) if (t[r + i] > EPS) {
+    if (i < nx0) nx0 = i; if (i > nx1) nx1 = i; if (j < ny0) ny0 = j; if (j > ny1) ny1 = j; } }
+  if (nx1 < 0) { nx0 = nx1 = d.bx0; ny0 = ny1 = d.by0; }
+  d.bx0 = nx0; d.bx1 = nx1; d.by0 = ny0; d.by1 = ny1;
+}
+function newDrop(cell, k) {
+  const cx = cell % NX, cy = (cell / NX) | 0;
+  const d = { cell, k, age: 0, x: cx + 0.5, y: cy + 0.5, c: new Float64Array(N), t: new Float64Array(N),
+    bx0: cx - 1, bx1: cx + 1, by0: cy - 1, by1: cy + 1 };
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++)   // a small round drop
+    d.c[(cy + dy) * NX + cx + dx] = MASS * (dx || dy ? (dx && dy ? 0.05 : 0.1) : 0.4);
+  return d;
+}
+function advance(d) { stepDrop(d); const s = d.c; d.c = d.t; d.t = s; d.age++; }
+let cache = new Map();           // settled shape of a drop released in a cell, this level
+function settledDrop(cell) {
+  if (!cache.has(cell)) { const d = newDrop(cell, 0); while (d.age < STEPS) advance(d); cache.set(cell, d.c); }
+  return cache.get(cell);
+}
+
+// ---------- comparing the tank with the target ----------
+function blurInto(src, out, sigma) {   // separable gaussian, weights renormalised at the glass
+  const r = Math.ceil(sigma * 2.5), w = [];
+  for (let i = -r; i <= r; i++) w.push(Math.exp(-i * i / (2 * sigma * sigma)));
+  const tmp = new Float64Array(N);
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) {
+    let s = 0, ws = 0;
+    for (let i = -r; i <= r; i++) { const xx = x + i; if (xx < 0 || xx >= NX) continue; s += src[y * NX + xx] * w[i + r]; ws += w[i + r]; }
+    tmp[y * NX + x] = s / ws;
+  }
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) {
+    let s = 0, ws = 0;
+    for (let i = -r; i <= r; i++) { const yy = y + i; if (yy < 0 || yy >= NY) continue; s += tmp[yy * NX + x] * w[i + r]; ws += w[i + r]; }
+    out[y * NX + x] = s / ws;
+  }
+}
+function look(fields, sigma) {         // what the eye sees of each ink, softened
+  const out = [], b = new Float64Array(N);
+  for (let k = 0; k < 4; k++) {
+    if (!spec.cols.includes(k)) { out.push(null); continue; }
+    blurInto(fields[k], b, sigma);
+    const v = new Float64Array(N);
+    for (let i = 0; i < N; i++) v[i] = 1 - Math.exp(-K * b[i]);
+    out.push(v);
+  }
+  return out;
+}
+function closeness(fields) {           // 1 = the same as the target, 0 = nothing in common; the weakest ink counts
+  const v = look(fields, spec.blur);
+  let worst = 1;
+  for (let k = 0; k < 4; k++) {
+    if (!v[k]) continue;
+    const a = v[k], b = targetLook[k];
+    let diff = 0, big = 0;
+    for (let i = 0; i < N; i++) { diff += Math.abs(a[i] - b[i]); big += Math.max(a[i], b[i]); }
+    worst = Math.min(worst, big > 0 ? Math.max(0, 1 - diff / big) : 0);
+  }
+  return worst;
+}
+
+// ---------- levels: drops placed at random, simulated, and the result becomes the target ----------
+let spec, target, targetLook;
+function levelSpec(n) {
+  const hard = n % 5 === 0;                  // a harder level every 5 levels
+  const t = (n - 1) / (TOTAL - 1);
+  let nc = n <= 8 ? 2 : n <= 30 ? (rnd() < 0.35 ? 3 : 2) : n <= 80 ? (rnd() < 0.75 ? 3 : 2) : (rnd() < 0.45 ? 4 : 3);
+  if (hard && n > 8) nc = Math.min(n > 80 ? 4 : 3, nc + 1);
+  let cols;
+  if (nc === 4) cols = [0, 1, 2, 3];
+  else if (nc === 3) cols = n > 80 && rnd() < 0.35 ? [[0, 2, 3], [1, 2, 3], [0, 1, 3]][ri(0, 2)] : [0, 1, 2];
+  else cols = [[1, 2], [0, 2], [0, 1]][ri(0, 2)];
+  let drops = 2 + Math.floor(t * 5.4 + rnd() * 1.3) + (hard ? 1 : 0);
+  drops = Math.max(nc, Math.min(9, drops));
+  const counts = cols.map(() => 1);
+  for (let left = drops - nc; left > 0;) { const i = ri(0, nc - 1); if (counts[i] < 3) { counts[i]++; left--; } }
+  return { cols, counts, drops, hard, blur: 3.6 - 1.5 * t - (hard ? 0.4 : 0), thr: 0.6 + 0.07 * t + (hard ? 0.02 : 0) };
+}
+function placeDrops() {
+  const list = [], at = c => [c % NX, (c / NX) | 0];
+  const ks = []; spec.cols.forEach((k, i) => { for (let j = 0; j < spec.counts[i]; j++) ks.push(k); });
+  for (let i = ks.length - 1; i > 0; i--) { const j = ri(0, i); [ks[i], ks[j]] = [ks[j], ks[i]]; }
+  for (const k of ks) {
+    let best = null;
+    for (let a = 0; a < 60 && !best; a++) {
+      let x, y;
+      const other = list.filter(d => d.k !== k);
+      if (other.length && rnd() < 0.45) {         // near a drop of another colour, so they mix
+        const [ox, oy] = at(other[ri(0, other.length - 1)].cell), ang = rnd() * 6.283, r = 7 + rnd() * 7;
+        x = Math.round(ox + Math.cos(ang) * r); y = Math.round(oy + Math.sin(ang) * r);
+      } else { x = ri(5, NX - 6); y = ri(4, NY - 18); }
+      if (x < 5 || x > NX - 6 || y < 3 || y > NY - 16) continue;
+      const ok = list.every(d => { const [dx, dy] = at(d.cell), dd = Math.hypot(dx - x, dy - y); return dd >= (d.k === k ? 10 : 6); });
+      if (ok || a === 59) best = { cell: y * NX + x, k };
+    }
+    list.push(best);
+  }
+  return list;
+}
+function sumFields(list) {
+  const f = [0, 1, 2, 3].map(() => new Float64Array(N));
+  for (const d of list) { const c = d.c || settledDrop(d.cell), a = f[d.k]; for (let i = 0; i < N; i++) a[i] += c[i]; }
+  return f;
+}
+function readable(f) {           // every colour shows clearly somewhere, and colours meet somewhere
+  const pure = spec.cols.map(() => 0); let mixed = 0;
+  for (let i = 0; i < N; i++) {
+    const tot = f[0][i] + f[1][i] + f[2][i] + f[3][i];
+    if (1 - Math.exp(-K * tot) < 0.5) continue;
+    let shares = 0;
+    spec.cols.forEach((k, j) => { const s = f[k][i] / tot; if (s > 0.68) pure[j]++; if (s > 0.25) shares++; });
+    if (shares >= 2) mixed++;
+  }
+  return pure.every(p => p >= 6) && mixed >= 6;
+}
+function buildLevel(n) {
+  seed = seedFor(n);
+  cache = new Map();
+  buildFlow();
+  spec = levelSpec(n);
+  let list;
+  for (let a = 0; a < 12; a++) { list = placeDrops(); if (readable(sumFields(list))) break; }
+  spec.solution = list.map(d => ({ cell: d.cell, k: d.k }));
+  target = sumFields(list);
+  targetLook = look(target, spec.blur);
+}
+// the next level is built while the finished tank rests, so "next" opens it at once
+let ready = null;
+const grab = () => ({ UF, VF, spec, target, targetLook, cache });
+function put(o) { ({ UF, VF, spec, target, targetLook, cache } = o); }
+function prepare(n) {
+  const keep = grab();
+  buildLevel(n); ready = { n, ...grab() };
+  put(keep);
+}
+
+// ---------- play ----------
+let drops, left, sel, state, endTimer, score, evaluated, dirty, acc, ripples, ghostA = 0.7;
+function newLevel(n) {
+  level = n;
+  lvlLabel.textContent = n + " / " + TOTAL;
+  if (ready && ready.n === n) put(ready); else buildLevel(n);
+  ready = null;
+  sel = 0;
+  emptyTank();
+  layout();
+}
+function emptyTank() {
+  drops = []; left = spec.counts.slice(); state = "play"; endTimer = 0; score = 0;
+  evaluated = true; dirty = true; acc = 0; ripples = [];
+  sel = Math.max(0, Math.min(sel, spec.cols.length - 1));
+  endBox.classList.add("hidden"); showTools();
+}
+function release(cell, slot) {    // let a drop of colour spec.cols[slot] into the water at a cell
+  if (state !== "play" || left[slot] <= 0) return false;
+  left[slot]--;
+  drops.push(newDrop(cell, spec.cols[slot]));
+  evaluated = false; dirty = true;
+  if (left[slot] === 0) { const nxt = left.findIndex(v => v > 0); if (nxt >= 0) sel = nxt; }
+  showTools();
+  return true;
+}
+function undo() {
+  if (!drops.length || state === "won") return;
+  const d = drops.pop(), slot = spec.cols.indexOf(d.k);
+  left[slot]++; sel = slot;
+  state = "play"; endBox.classList.add("hidden");
+  evaluated = false; dirty = true; showTools();
+}
+function showTools() {
+  const won = state === "won";
+  undoBtn.classList.toggle("hidden", won); emptyBtn.classList.toggle("hidden", won);
+  undoBtn.disabled = !drops.length; emptyBtn.disabled = !drops.length;
+}
+const settled = () => drops.every(d => d.age >= STEPS);
+function update(dt) {             // dt in seconds
+  if (state !== "won") {
+    acc = Math.min(acc + dt * RATE, 12);
+    while (acc >= 1) {
+      acc--;
+      let moved = false;
+      for (const d of drops) if (d.age < STEPS) { advance(d); moved = true; }
+      if (moved) dirty = true; else { acc = 0; break; }
+    }
+  }
+  for (const r of ripples) r.t += dt;
+  ripples = ripples.filter(r => r.t < 1.6);
+  if (state === "play" && !evaluated && settled()) {
+    evaluated = true;
+    score = closeness(sumFields(drops));
+    if (left.every(v => v === 0)) {                // the tank is checked once every drop is in and resting
+      if (score >= spec.thr) {
+        state = "won"; endTimer = 0; saved.set(level % TOTAL + 1); showTools();
+        const lv = level; setTimeout(() => { if (state === "won" && level === lv && !ready) prepare(lv % TOTAL + 1); }, 300);
+      } else { state = "lost"; endTimer = 0; }
+    }
+  } else if (state !== "play" && endBox.classList.contains("hidden") && (endTimer += dt) > 0.8) {
+    nextBtn.textContent = state === "won" ? "next" : "again";
+    endBox.classList.remove("hidden");
+  }
+}
+
+// ---------- layout ----------
+let W, H, dpr, cs, tx, ty, tw, th, mw, mh, mx, my, barY, botY, toolY, bs;
+let waterCv, ghostCv, miniCv, inkCv, inkImg, tgtCv;
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = window.devicePixelRatio || 1;
+  cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px";
+  mh = Math.round(Math.max(56, Math.min(112, H * 0.12))); mw = Math.round(mh * 0.75);
+  bs = 56;                                         // ink bottle row height
+  const top = 44, gapT = 26, air = 12, below = 18 + bs + 12 + 46 + 14;
+  const avail = H - top - mh - gapT - air - below;
+  cs = Math.max(3, Math.min((W - 24) / NX, avail / NY, 9));
+  tw = cs * NX; th = cs * NY;
+  const used = top + mh + gapT + air + th + below;
+  const y0 = Math.max(0, (H - used) / 2) * 0.6;
+  tx = Math.round((W - tw) / 2);
+  mx = Math.round((W - mw) / 2); my = Math.round(y0 + top);
+  barY = my + mh + 10;
+  ty = Math.round(my + mh + gapT + air);
+  botY = ty + th + 18 + bs / 2;
+  toolY = botY + bs / 2 + 12;
+  lvlLabel.style.left = tx + "px"; lvlLabel.style.top = (my + mh / 2 - 14) + "px";
+  speedBtn.style.left = (tx + tw - 56) + "px"; speedBtn.style.top = (my + mh / 2 - 22) + "px";
+  undoBtn.style.left = tx + "px"; undoBtn.style.top = toolY + "px";
+  emptyBtn.style.left = (tx + tw - 96) + "px"; emptyBtn.style.top = toolY + "px";
+  endBox.style.top = (botY - 23) + "px";
+  buildCanvases();
+}
+function offscreen(w, h) { const c = document.createElement("canvas"); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h)); return c; }
+function paintWater(g, w, h, rich) {   // deep blue-black water, lit softly from above
+  const grad = g.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, "#11263f"); grad.addColorStop(0.4, "#0a182b"); grad.addColorStop(1, "#040912");
+  g.fillStyle = grad; g.fillRect(0, 0, w, h);
+  const glow = g.createRadialGradient(w * 0.42, -h * 0.05, 0, w * 0.42, -h * 0.05, h * 0.7);
+  glow.addColorStop(0, "rgba(110,160,220,0.16)"); glow.addColorStop(1, "rgba(110,160,220,0)");
+  g.fillStyle = glow; g.fillRect(0, 0, w, h);
+  if (!rich) return;
+  for (const [x0, wd, a] of [[0.16, 0.10, 0.022], [0.40, 0.15, 0.026], [0.70, 0.08, 0.02]]) {   // shafts of light, soft at the edges
+    for (let l = 0; l < 5; l++) {
+      const grow = l * 0.025, lg = g.createLinearGradient(0, 0, 0, h * 0.85);
+      lg.addColorStop(0, `rgba(150,195,245,${a})`); lg.addColorStop(1, "rgba(150,195,245,0)");
+      g.fillStyle = lg; g.beginPath();
+      g.moveTo(w * (x0 + grow), 0); g.lineTo(w * (x0 + wd - grow), 0);
+      g.lineTo(w * (x0 + wd + 0.12 - grow * 1.5), h * 0.85); g.lineTo(w * (x0 + 0.04 + grow * 1.5), h * 0.85); g.closePath(); g.fill();
+    }
+  }
+  const fl = g.createLinearGradient(0, h * 0.9, 0, h);                 // the floor of the tank
+  fl.addColorStop(0, "rgba(40,60,90,0)"); fl.addColorStop(1, "rgba(40,60,90,0.3)");
+  g.fillStyle = fl; g.fillRect(0, h * 0.9, w, h * 0.1);
+}
+function paintInk(fields, img, alpha = 1) {
+  const d = img.data, F = fields;
+  for (let i = 0; i < N; i++) {
+    const r = F[0][i], y = F[1][i], b = F[2][i], w = F[3][i], tot = r + y + b + w, o = i * 4;
+    if (tot < 1e-4) { d[o + 3] = 0; continue; }
+    const c = mix(r, y, b, w);
+    d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255 * alpha * (1 - Math.exp(-K * tot));
+  }
+}
+function buildCanvases() {
+  waterCv = offscreen(tw * dpr, th * dpr);
+  const wg = waterCv.getContext("2d"); wg.scale(dpr, dpr); paintWater(wg, tw, th, true);
+  inkCv = offscreen(NX, NY); inkImg = inkCv.getContext("2d").createImageData(NX, NY);
+  tgtCv = offscreen(NX, NY);
+  const ti = tgtCv.getContext("2d").createImageData(NX, NY); paintInk(target, ti); tgtCv.getContext("2d").putImageData(ti, 0, 0);
+  // the target in the tank: the same picture, seen through a fine stencil of dots
+  ghostCv = offscreen(tw * dpr, th * dpr);
+  const gg = ghostCv.getContext("2d");
+  gg.imageSmoothingEnabled = true; gg.imageSmoothingQuality = "high";
+  gg.drawImage(tgtCv, 0, 0, ghostCv.width, ghostCv.height);
+  const dot = offscreen(4 * dpr, 4 * dpr), dg = dot.getContext("2d");
+  dg.fillStyle = "#fff"; dg.beginPath(); dg.arc(2 * dpr, 2 * dpr, 0.95 * dpr, 0, 7); dg.fill();
+  gg.globalCompositeOperation = "destination-in"; gg.fillStyle = gg.createPattern(dot, "repeat"); gg.fillRect(0, 0, ghostCv.width, ghostCv.height);
+  // the small picture of the target above the tank
+  miniCv = offscreen(mw * dpr, mh * dpr);
+  const mg = miniCv.getContext("2d"); mg.scale(dpr, dpr); paintWater(mg, mw, mh, false);
+  mg.imageSmoothingEnabled = true; mg.imageSmoothingQuality = "high"; mg.drawImage(tgtCv, 0, 0, mw, mh);
+}
+
+// ---------- drawing ----------
+function rrect(g, x, y, w, h, r) { g.beginPath(); g.roundRect ? g.roundRect(x, y, w, h, r) : g.rect(x, y, w, h); }
+function drawBottle(i, x, y) {
+  const k = spec.cols[i], col = pigColour(k), on = i === sel && state !== "won", empty = left[i] === 0;
+  const r = 15, by = y - 4 + (on ? -3 : 0);
+  ctx.globalAlpha = empty ? 0.35 : 1;
+  if (on) { ctx.beginPath(); ctx.arc(x, by, r + 7, 0, 7); ctx.fillStyle = "rgba(200,220,245,0.10)"; ctx.fill();
+    ctx.strokeStyle = "rgba(214,226,242,0.75)"; ctx.lineWidth = 1.5; ctx.stroke(); }
+  ctx.fillStyle = "#1a2a40"; ctx.fillRect(x - 4, by - r - 7, 8, 9);            // neck
+  ctx.fillStyle = "#7d6a58"; ctx.fillRect(x - 5, by - r - 10, 10, 4);          // cork
+  ctx.beginPath(); ctx.arc(x, by, r, 0, 7); ctx.fillStyle = "#1a2a40"; ctx.fill();
+  ctx.beginPath(); ctx.arc(x, by + 2, r - 3, 0, 7); ctx.fillStyle = css(col); ctx.fill();
+  ctx.beginPath(); ctx.arc(x - 5, by - 4, 3, 0, 7); ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.fill();
+  const n = spec.counts[i], gap = 9, x0 = x - (n - 1) * gap / 2;                 // one dot for each drop
+  for (let j = 0; j < n; j++) {
+    ctx.beginPath(); ctx.arc(x0 + j * gap, y + 23, 2.8, 0, 7);
+    if (j < left[i]) { ctx.fillStyle = css(col); ctx.fill(); }
+    else { ctx.strokeStyle = css(col, 0.6); ctx.lineWidth = 1; ctx.stroke(); }
+  }
+  ctx.globalAlpha = 1;
+}
+function bottleX(i) { const n = spec.cols.length, gap = Math.min(78, (tw - 20) / n); return W / 2 + (i - (n - 1) / 2) * gap; }
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  // target picture and how close the tank is to it
+  rrect(ctx, mx - 3, my - 3, mw + 6, mh + 6, 5); ctx.fillStyle = "#1b2b42"; ctx.fill();
+  ctx.drawImage(miniCv, mx, my, mw, mh);
+  const bw = mw + 30, bx = W / 2 - bw / 2;
+  rrect(ctx, bx, barY, bw, 4, 2); ctx.fillStyle = "#1a2a40"; ctx.fill();
+  const done = score >= spec.thr;
+  rrect(ctx, bx, barY, Math.max(4, bw * score), 4, 2); ctx.fillStyle = done ? "#8fd3a8" : "#5d7fa8"; ctx.fill();
+  ctx.fillStyle = "#9fb2cc"; ctx.fillRect(Math.round(bx + bw * spec.thr) - 0.5, barY - 3, 1.5, 10);
+  // the tank: air above the water, glass around it
+  rrect(ctx, tx - 6, ty - 18, tw + 12, th + 24, 6); ctx.fillStyle = "#0b1422"; ctx.fill();
+  ctx.drawImage(waterCv, tx, ty, tw, th);
+  ghostA += ((state === "won" ? 0 : 0.7) - ghostA) * 0.06;            // the target fades once the tank matches it
+  if (ghostA > 0.01) { ctx.globalAlpha = ghostA; ctx.drawImage(ghostCv, tx, ty, tw, th); ctx.globalAlpha = 1; }
+  if (level <= 2 && !drops.length) {                                   // a quiet word on the first levels
+    ctx.fillStyle = "#8fa3c0"; ctx.font = "13px ui-monospace, Menlo, Consolas, monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("tap the water to let ink fall", tx + tw / 2, ty + th * 0.2);
+    ctx.fillText("match the dotted clouds", tx + tw / 2, ty + th * 0.2 + 22);
+  }
+  if (dirty) {
+    paintInk(sumFields(drops), inkImg); inkCv.getContext("2d").putImageData(inkImg, 0, 0);
+    if (state === "play" && drops.length && !evaluated) score = closeness(sumFields(drops));
+    else if (!drops.length) score = 0;
+    dirty = false;
+  }
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(inkCv, tx, ty, tw, th);
+  for (const r of ripples) {                                   // a soft ring where a drop went in
+    const a = 0.35 * (1 - r.t / 1.6);
+    ctx.beginPath(); ctx.ellipse(r.x, r.y, 4 + r.t * 16, 2 + r.t * 6, 0, 0, 7);
+    ctx.strokeStyle = `rgba(200,225,255,${a})`; ctx.lineWidth = 1.2; ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(170,205,240,0.35)"; ctx.fillRect(tx, ty - 1, tw, 1.5);            // the water surface
+  ctx.fillStyle = "rgba(190,215,245,0.07)"; ctx.fillRect(tx + 3, ty, 3, th);               // light on the glass
+  rrect(ctx, tx - 6, ty - 18, tw + 12, th + 24, 6); ctx.strokeStyle = "rgba(150,190,230,0.32)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#1b2b42"; ctx.fillRect(tx - 14, ty + th + 6, tw + 28, 4);               // the shelf
+  // ink bottles
+  if (state !== "won") for (let i = 0; i < spec.cols.length; i++) drawBottle(i, bottleX(i), botY);
+}
+
+// ---------- input ----------
+cv.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  if (x >= tx - 6 && x < tx + tw + 6 && y >= ty - 18 && y < ty + th + 6) {
+    const cx = Math.max(1, Math.min(NX - 2, Math.floor((x - tx) / cs)));
+    const cy = Math.max(1, Math.min(NY - 3, Math.floor((y - ty) / cs)));
+    if (release(cy * NX + cx, sel) && !calm) ripples.push({ x: tx + (cx + 0.5) * cs, y: ty + (cy + 0.5) * cs, t: 0 });
+    return;
+  }
+  if (state === "won" || Math.abs(y - botY) > bs / 2 + 8) return;
+  for (let i = 0; i < spec.cols.length; i++)
+    if (Math.abs(x - bottleX(i)) <= 30 && left[i] > 0) { sel = i; return; }
+});
+nextBtn.addEventListener("click", () => { if (state === "won") newLevel(level % TOTAL + 1); else emptyTank(); });
+undoBtn.addEventListener("click", undo);
+emptyBtn.addEventListener("click", () => { if (state !== "won") emptyTank(); });
+speedBtn.addEventListener("click", () => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  speedBtn.textContent = SPEEDS[speedIdx] + "×";
+});
+addEventListener("resize", () => { layout(); });
+
+// ---------- loop ----------
+let last = 0;
+function frame(t) {
+  const dt = Math.min(0.05, (t - last) / 1000);
+  if (t - last >= 30) {                                     // about 30 frames a second is plenty
+    last = t;
+    update(dt * SPEEDS[speedIdx]);                          // faster = more steps per frame, same rules
+    draw();
+  }
+  requestAnimationFrame(frame);
+}
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>

@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2b1f19">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Watching paint dry</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #2b1f19; overflow: hidden;
+    touch-action: manipulation; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; }
+  button { font: 14px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .08em;
+    color: #ecdcc6; background: #241a14; border: 1px solid #74604e; border-radius: 6px;
+    height: 44px; padding: 0 14px; cursor: pointer; position: fixed; }
+  button:active { background: #1b130e; }
+  button:focus-visible { outline: 2px solid #ecdcc6; outline-offset: 2px; }
+  #home { position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 12px; line-height: 28px;
+    font: 13px/28px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #b8a189; text-decoration: none; }
+  #home:focus-visible { outline: 2px solid #ecdcc6; outline-offset: 3px; }
+  #lvl { position: fixed; top: calc(8px + env(safe-area-inset-top)); height: 28px; line-height: 28px;
+    font: 13px/28px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .08em; color: #cdb79e; }
+  #speed { top: calc(8px + env(safe-area-inset-top)); right: 12px; height: 28px; padding: 0 12px; font-size: 13px; }
+  #dryer { background: transparent; padding: 0; }
+  #dryer:active { background: rgba(0,0,0,.15); }
+  #next { width: 104px; padding: 0; }
+  #hint { position: fixed; left: 12px; right: 12px; text-align: center;
+    font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .04em; color: #b8a189; }
+  #safe { position: fixed; top: 0; height: env(safe-area-inset-top); width: 1px; visibility: hidden; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="safe"></div>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="lvl"></div>
+<button id="speed" aria-label="speed">1×</button>
+<button id="undo">undo</button>
+<button id="restart">restart</button>
+<button id="dryer" aria-label="hairdryer" title="hairdryer"></button>
+<button id="next" class="hidden">next</button>
+<div id="hint" class="hidden">paint the faint mural. later coats cover earlier ones; let each coat dry.</div>
+<script>
+"use strict";
+// ---------- settings ----------
+const TOTAL = 200;                 // levels on offer
+const WU = 100, HU = 120;          // the wall, in wall units
+const GX = 50, GY = 60, CU = 2;    // the grid the game checks the wall on: GX x GY cells of CU units
+const CELLS = GX * GY;
+const FX = 200, FY = 240, FU = 0.5; // a finer grid, only for drawing the hatching with smooth edges
+const DRY = 15;                    // seconds for a fresh coat to dry, at 1×
+const BLOW = 4, BLOW_RATE = 1.8;   // one press of the hairdryer: seconds of air, and how much faster paint dries meanwhile
+const REVEAL = 0.8;                // seconds to brush a coat on
+const ROOM = "#2b1f19", INK = "#ecdcc6", MUTED = "#b8a189";
+const PAINTS = [                   // clear colours that stay readable on plaster in a dim room
+  [214, 66, 54],   // tomato red
+  [240, 140, 40],  // orange
+  [244, 206, 58],  // yellow
+  [84, 168, 72],   // leaf green
+  [28, 156, 150],  // teal
+  [58, 100, 200],  // blue
+  [134, 80, 180],  // violet
+  [242, 140, 182], // pink
+  [46, 50, 68],    // ink
+];
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const lvlLabel = document.getElementById("lvl");
+const speedBtn = document.getElementById("speed");
+const undoBtn = document.getElementById("undo");
+const restartBtn = document.getElementById("restart");
+const dryerBtn = document.getElementById("dryer");
+const nextBtn = document.getElementById("next");
+const hint = document.getElementById("hint");
+const safeProbe = document.getElementById("safe");
+const SPEEDS = [1, 2, 3, 5];
+let speedIdx = 0;
+const calm = (() => { try { return matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; } })();
+
+// ---------- seeded random ----------
+let seed = 0;
+function rnd() { // mulberry32
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+
+// ---------- numbered levels: level n always builds the same wall ----------
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+const saved = {                  // progress, kept in this browser only
+  get() { try { return parseInt(localStorage.getItem("paint.level"), 10) || 1; } catch (e) { return 1; } },
+  set(n) { try { localStorage.setItem("paint.level", String(n)); } catch (e) {} },
+};
+
+const css = (c, a) => a === undefined ? `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})` : `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const mix = (a, b, f) => [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ---------- stencil shapes: each has a test for a point and a path to paint, both in wall units ----------
+// place(lo, hi, t): a random spot in [lo, hi], near t when given (shapes cluster so they overlap)
+const place = (lo, hi, t) => hi <= lo ? (lo + hi) / 2 : t == null ? lo + rnd() * (hi - lo) : clamp(t + (rnd() - 0.5) * 18, lo, hi);
+function triContains(A, B, C) {
+  const s = (p, q, x, y) => (q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0]);
+  return (x, y) => { const a = s(A, B, x, y), b = s(B, C, x, y), c = s(C, A, x, y); return (a >= 0 && b >= 0 && c >= 0) || (a <= 0 && b <= 0 && c <= 0); };
+}
+const MAKERS = {
+  rect(tx, ty) {
+    const w = 24 + rnd() * 30, h = 24 + rnd() * 36;
+    const x = place(4 + w / 2, 96 - w / 2, tx) - w / 2, y = place(4 + h / 2, 116 - h / 2, ty) - h / 2;
+    return { has: (px, py) => px >= x && px < x + w && py >= y && py < y + h, draw: p => p.rect(x, y, w, h) };
+  },
+  disc(tx, ty) {
+    const r = 12 + rnd() * 12, cx = place(r + 3, 97 - r, tx), cy = place(r + 3, 117 - r, ty);
+    return { has: (px, py) => (px - cx) ** 2 + (py - cy) ** 2 < r * r, draw: p => p.arc(cx, cy, r, 0, Math.PI * 2) };
+  },
+  hband(tx, ty) {
+    const h = 11 + rnd() * 12, y = place(4 + h / 2, 116 - h / 2, ty) - h / 2;
+    return { has: (px, py) => py >= y && py < y + h, draw: p => p.rect(-2, y, WU + 4, h) };
+  },
+  vband(tx, ty) {
+    const w = 11 + rnd() * 11, x = place(4 + w / 2, 96 - w / 2, tx) - w / 2;
+    return { has: px => px >= x && px < x + w, draw: p => p.rect(x, -2, w, HU + 4) };
+  },
+  bands(tx, ty) {                         // two or three parallel stripes
+    const cnt = rnd() < 0.5 ? 2 : 3, bw = 6.5 + rnd() * 3, gap = 6 + rnd() * 4, tot = cnt * bw + (cnt - 1) * gap;
+    const across = rnd() < 0.5, s = across ? place(3 + tot / 2, 117 - tot / 2, ty) - tot / 2 : place(3 + tot / 2, 97 - tot / 2, tx) - tot / 2;
+    const on = q => { const d = q - s; return d >= 0 && d < tot && d % (bw + gap) < bw; };
+    return { has: (px, py) => on(across ? py : px), draw: p => { for (let i = 0; i < cnt; i++) { const o = s + i * (bw + gap); across ? p.rect(-2, o, WU + 4, bw) : p.rect(o, -2, bw, HU + 4); } } };
+  },
+  diag(tx, ty) {                          // a slanted band right across the wall
+    const a = (rnd() < 0.5 ? -1 : 1) * (0.35 + rnd() * 0.5), hw = 5.5 + rnd() * 5;
+    const cx = place(25, 75, tx), cy = place(30, 90, ty), sn = Math.sin(a), cs = Math.cos(a);
+    return { has: (px, py) => Math.abs(-(px - cx) * sn + (py - cy) * cs) < hw,
+      draw: p => { p.moveTo(cx - cs * 200 - sn * hw, cy - sn * 200 + cs * hw); p.lineTo(cx + cs * 200 - sn * hw, cy + sn * 200 + cs * hw);
+        p.lineTo(cx + cs * 200 + sn * hw, cy + sn * 200 - cs * hw); p.lineTo(cx - cs * 200 + sn * hw, cy - sn * 200 - cs * hw); p.closePath(); } };
+  },
+  triangle(tx, ty) {                      // a hill on the floor line, or a pennant hanging from the top
+    const up = rnd() < 0.6, hw = 20 + rnd() * 22, ax = place(16, 84, tx);
+    const ay = up ? place(30, 84, ty) : place(36, 90, ty), by = up ? HU + 1 : -1;
+    const A = [ax, ay], B = [ax - hw, by], C = [ax + hw, by];
+    return { has: triContains(A, B, C), draw: p => { p.moveTo(A[0], A[1]); p.lineTo(B[0], B[1]); p.lineTo(C[0], C[1]); p.closePath(); } };
+  },
+  arch(tx, ty) {                          // a doorway or window: a rectangle with a round top
+    const r = 10 + rnd() * 8, cx = place(r + 3, 97 - r, tx);
+    const bottom = rnd() < 0.5 ? HU + 1 : place(70, 112, ty), top = Math.max(r + 4, bottom - (2 * r + 14 + rnd() * 26) + r);
+    return { has: (px, py) => (px >= cx - r && px < cx + r && py >= top && py < bottom) || (py < top && (px - cx) ** 2 + (py - top) ** 2 < r * r),
+      draw: p => { p.moveTo(cx - r, bottom); p.lineTo(cx - r, top); p.arc(cx, top, r, Math.PI, Math.PI * 2); p.lineTo(cx + r, bottom); p.closePath(); } };
+  },
+  dots(tx, ty) {                          // a row of spots
+    const cnt = ri(3, 5), r = 5.5 + rnd() * 2.5, a = rnd() * Math.PI, step = 2 * r + 3 + rnd() * 4;
+    const span = step * (cnt - 1), cx = place(10 + span / 2 * Math.abs(Math.cos(a)), 90 - span / 2 * Math.abs(Math.cos(a)), tx);
+    const cy = place(10 + span / 2 * Math.abs(Math.sin(a)), 110 - span / 2 * Math.abs(Math.sin(a)), ty), pts = [];
+    for (let i = 0; i < cnt; i++) { const d = -span / 2 + i * step; pts.push([clamp(cx + Math.cos(a) * d, r + 1, WU - r - 1), clamp(cy + Math.sin(a) * d, r + 1, HU - r - 1)]); }
+    return { has: (px, py) => pts.some(q => (px - q[0]) ** 2 + (py - q[1]) ** 2 < r * r),
+      draw: p => { for (const q of pts) { p.moveTo(q[0] + r, q[1]); p.arc(q[0], q[1], r, 0, Math.PI * 2); } } };
+  },
+  ring(tx, ty) {
+    const R = 15 + rnd() * 10, t = 6 + rnd() * 3, cx = place(R + 3, 97 - R, tx), cy = place(R + 3, 117 - R, ty);
+    return { has: (px, py) => { const d = (px - cx) ** 2 + (py - cy) ** 2; return d < R * R && d >= (R - t) ** 2; },
+      draw: p => { p.arc(cx, cy, R, 0, Math.PI * 2, false); p.moveTo(cx + R - t, cy); p.arc(cx, cy, R - t, 0, Math.PI * 2, true); } };
+  },
+  diamond(tx, ty) {
+    const rx = 13 + rnd() * 12, ry = 17 + rnd() * 14, cx = place(rx + 3, 97 - rx, tx), cy = place(ry + 3, 117 - ry, ty);
+    return { has: (px, py) => Math.abs(px - cx) / rx + Math.abs(py - cy) / ry < 1,
+      draw: p => { p.moveTo(cx, cy - ry); p.lineTo(cx + rx, cy); p.lineTo(cx, cy + ry); p.lineTo(cx - rx, cy); p.closePath(); } };
+  },
+  wave(tx, ty) {                          // a wavy band right across the wall
+    const hw = 4.5 + rnd() * 3, A = 4 + rnd() * 4, lam = 30 + rnd() * 25, ph = rnd() * 6.283;
+    const yc = place(8 + A + hw, 112 - A - hw, ty), f = x => yc + A * Math.sin(x / lam * 6.283 + ph);
+    return { has: (px, py) => Math.abs(py - f(px)) < hw,
+      draw: p => { p.moveTo(-2, f(-2) - hw); for (let x = 0; x <= WU + 2; x += 2) p.lineTo(x, f(x) - hw);
+        for (let x = WU + 2; x >= -2; x -= 2) p.lineTo(x, f(x) + hw); p.closePath(); } };
+  },
+  cross(tx, ty) {
+    const t = 9 + rnd() * 6, L = 34 + rnd() * 22, cx = place(L / 2 + 3, 97 - L / 2, tx), cy = place(L / 2 + 3, 117 - L / 2, ty);
+    return { has: (px, py) => (Math.abs(px - cx) < t / 2 && Math.abs(py - cy) < L / 2) || (Math.abs(py - cy) < t / 2 && Math.abs(px - cx) < L / 2),
+      draw: p => { p.rect(cx - t / 2, cy - L / 2, t, L); p.rect(cx - L / 2, cy - t / 2, L, t); } };
+  },
+  sun(tx, ty) {                           // a half disc rising from an edge
+    const r = 20 + rnd() * 14, side = ri(0, 3);
+    const cx = side === 0 ? place(16, 84, tx) : side === 1 ? place(16, 84, tx) : side === 2 ? 0 : WU;
+    const cy = side === 0 ? HU : side === 1 ? 0 : place(20, 100, ty);
+    return { has: (px, py) => (px - cx) ** 2 + (py - cy) ** 2 < r * r, draw: p => p.arc(cx, cy, r, 0, Math.PI * 2) };
+  },
+};
+const TIERS = [["rect", "disc", "hband", "vband"], ["bands", "triangle", "arch", "diag"], ["dots", "ring", "diamond", "wave", "cross", "sun"]];
+
+function makeShape(kind, tx, ty) {
+  const s = MAKERS[kind](tx, ty), mask = new Uint8Array(CELLS);
+  let area = 0, sx = 0, sy = 0;
+  for (let y = 0; y < GY; y++) for (let x = 0; x < GX; x++)
+    if (s.has(x * CU + CU / 2, y * CU + CU / 2)) { mask[y * GX + x] = 1; area++; sx += x; sy += y; }
+  s.kind = kind; s.mask = mask; s.area = area;
+  s.cx = area ? (sx / area + 0.5) * CU : 50; s.cy = area ? (sy / area + 0.5) * CU : 60;
+  return s;
+}
+
+// ---------- level parameters: more shapes, colours and overlaps as levels go on; every 5th wall is harder ----------
+function params(n) {
+  const hard = n % 5 === 0 && n > 1;
+  const count = Math.min(8, Math.min(7, 3 + Math.floor((n - 1) / 24)) + (hard ? 1 : 0));
+  let tier = n < 8 ? 0 : n < 25 ? 1 : 2;
+  if (hard) tier = Math.min(2, tier + 1);
+  const caps = [1, 1, 1, 1, 2, 3, 4, 6, 8];
+  const cap = hard ? Math.max(1, Math.ceil(caps[count] / 2)) : caps[count];
+  return { hard, count, tier, cap };
+}
+
+// how many orders paint the same picture: the orders that keep every visible "a under b"
+function countOrders(pred, n) {
+  const full = (1 << n) - 1, f = new Float64Array(1 << n);
+  f[full] = 1;
+  for (let S = full - 1; S >= 0; S--) {
+    let t = 0;
+    for (let v = 0; v < n; v++) if (!(S >> v & 1) && (pred[v] & S) === pred[v]) t += f[S | 1 << v];
+    f[S] = t;
+  }
+  return f[0];
+}
+
+// one candidate wall: shapes in painting order, then the checks that make it a fair puzzle
+function tryWall(p, relax) {
+  const n = p.count, pool = [];
+  for (let t = 0; t <= p.tier; t++) pool.push(...TIERS[t]);
+  const sh = [];
+  for (let i = 0; i < n; i++) {
+    let tx = null, ty = null;
+    if (i > 0) {                          // lean on a shape already there, so coats overlap
+      const b = sh[rnd() < 0.6 ? i - 1 : ri(0, i - 1)];
+      tx = b.cx; ty = b.cy;
+    }
+    const s = makeShape(pool[ri(0, pool.length - 1)], tx, ty);
+    if (s.area < 80 || s.area > CELLS * 0.45) return null;
+    sh.push(s);
+  }
+  const top = new Int8Array(CELLS).fill(-1);
+  for (let i = 0; i < n; i++) { const m = sh[i].mask; for (let c = 0; c < CELLS; c++) if (m[c]) top[c] = i; }
+  const vis = new Array(n).fill(0);
+  for (let c = 0; c < CELLS; c++) if (top[c] >= 0) vis[top[c]]++;
+  const minFrac = Math.max(0.1, 0.24 - relax * 0.04);
+  for (let i = 0; i < n; i++) if (vis[i] < Math.max(24, sh[i].area * minFrac)) return null;
+  // evidence: where i and j overlap, the cells where j shows on top of i
+  const pred = new Array(n).fill(0), linked = new Array(n).fill(false);
+  let edges = 0;
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const a = sh[i].mask, b = sh[j].mask; let ev = 0;
+    for (let c = 0; c < CELLS; c++) if (a[c] && b[c] && top[c] === j) ev++;
+    if (ev > 0 && ev < 10) return null;   // a sliver: too small to read in the dark
+    if (ev) { pred[j] |= 1 << i; linked[i] = linked[j] = true; edges++; }
+  }
+  if (n > 1 && linked.some(v => !v)) return null;
+  if (edges < n - 1) return null;
+  const orders = countOrders(pred, n);
+  if (orders > p.cap * (1 << relax)) return null;
+  return { shapes: sh, top, orders };
+}
+
+function generate(n) {
+  seed = seedFor(n);
+  const p = params(n);
+  let w = null, tries = 0;
+  for (; !w; tries++) w = tryWall(p, Math.min(6, Math.floor(tries / 700)));
+  const cols = PAINTS.map((c, i) => i);
+  for (let i = cols.length - 1; i > 0; i--) { const j = ri(0, i); [cols[i], cols[j]] = [cols[j], cols[i]]; }
+  w.shapes.forEach((s, i) => {
+    s.col = cols[i]; s.path = new Path2D(); s.draw(s.path);
+    let y0 = HU, y1 = 0; const edge = [];
+    for (let c = 0; c < CELLS; c++) if (s.mask[c]) {
+      const y = (c / GX) | 0; y0 = Math.min(y0, y * CU); y1 = Math.max(y1, (y + 1) * CU);
+      if (y < GY - 2 && !s.mask[c + GX]) edge.push(c);      // a lower edge, where a drip can start
+    }
+    s.y0 = y0; s.y1 = y1; s.edge = edge;
+  });
+  const targetF = new Int8Array(FX * FY).fill(-1);       // the mural on the fine grid
+  w.shapes.forEach((s, i) => {
+    s.fine = new Uint8Array(FX * FY);
+    for (let y = 0; y < FY; y++) for (let x = 0; x < FX; x++)
+      if (s.has(x * FU + FU / 2, y * FU + FU / 2)) { s.fine[y * FX + x] = 1; targetF[y * FX + x] = i; }
+  });
+  const order = w.shapes.map((s, i) => i);               // the stencil tray, shuffled
+  do { for (let i = order.length - 1; i > 0; i--) { const j = ri(0, i); [order[i], order[j]] = [order[j], order[i]]; } }
+  while (order.length > 1 && order.every((v, i) => v === i));
+  return { shapes: w.shapes, target: w.top, targetF, tray: order, orders: w.orders, tries, params: p };
+}
+
+// ---------- level state ----------
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+let L, coats, history, wallTop, matched, state, endTimer = 0, blow = 0, clock = 0, fan = 0;
+let baseDirty = true, guideDirty = true, baseCount = 0;
+
+function newLevel(n) {
+  level = n;
+  lvlLabel.textContent = n + " / " + TOTAL;
+  L = generate(n);
+  coats = []; history = []; state = "play"; endTimer = 0;
+  nextBtn.classList.add("hidden");
+  hint.classList.toggle("hidden", n !== 1);
+  refresh();
+  layout();
+}
+
+// what the wall shows now: the top coat on every cell, and whether it all matches the mural
+function refresh() {
+  wallTop = new Int8Array(CELLS).fill(-1);
+  coats.forEach((ct, i) => { const m = L.shapes[ct.k].mask; for (let c = 0; c < CELLS; c++) if (m[c]) wallTop[c] = i; });
+  matched = true;
+  for (let c = 0; c < CELLS; c++) {
+    const t = wallTop[c];
+    const k = t < 0 ? -1 : coats[t].k;
+    if (k !== L.target[c] || (t >= 0 && coats[t].smearSet && coats[t].smearSet[c])) { matched = false; break; }
+  }
+  baseDirty = guideDirty = true;
+}
+const used = k => coats.some(ct => ct.k === k);
+function wouldSmear(k) {
+  const m = L.shapes[k].mask;
+  for (let c = 0; c < CELLS; c++) if (m[c] && wallTop[c] >= 0 && coats[wallTop[c]].w > 0) return true;
+  return false;
+}
+
+// one coat of stencil k; where it goes over wet paint, the colours smear
+function paint(k) {
+  if (state !== "play" || used(k)) return false;
+  history.push(coats.slice());
+  const m = L.shapes[k].mask; let smear = null, smearSet = null;
+  for (let c = 0; c < CELLS; c++) if (m[c]) {
+    const t = wallTop[c];
+    if (t >= 0 && coats[t].w > 0) { if (!smear) { smear = []; smearSet = new Uint8Array(CELLS); } smear.push(c, coats[t].k); smearSet[c] = 1; }
+  }
+  coats.push({ k, w: 1, reveal: 0, smear, smearSet, drips: [], phase: Math.random() });
+  refresh();
+  return true;
+}
+function undo() { if (state === "play" && history.length) { coats = history.pop(); refresh(); } }
+function restart() { if (state === "play" && coats.length) { history.push(coats.slice()); coats = []; refresh(); } }
+
+// ---------- update ----------
+function update(dt) {
+  clock += dt;
+  if (blow > 0) { blow = Math.max(0, blow - dt); fan += dt * 26; }
+  for (const ct of coats) {
+    if (ct.reveal < 1) ct.reveal = Math.min(1, ct.reveal + dt / REVEAL);
+    if (ct.w > 0) {
+      ct.w -= dt / DRY * (blow > 0 ? BLOW_RATE : 1);
+      if (ct.w <= 0) { ct.w = 0; baseDirty = true; }
+      const sh = L.shapes[ct.k];
+      if (!calm && ct.reveal >= 1 && ct.w > 0.4 && ct.drips.length < 3 && sh.edge.length && Math.random() < dt * 0.09) {
+        const c = sh.edge[Math.floor(Math.random() * sh.edge.length)];
+        ct.drips.push({ x: (c % GX) * CU + 0.4 + Math.random() * 1.2, y: ((c / GX | 0) + 1) * CU - 0.6, len: 0,
+          max: 1.5 + Math.random() * 3, wd: 0.8 + Math.random() * 0.5 });
+      }
+    }
+    for (const d of ct.drips) if (ct.w > 0 && d.len < d.max) d.len = Math.min(d.max, d.len + dt * 0.55 * ct.w);
+  }
+  if (state === "play") {
+    if (matched && coats.length && coats.every(ct => ct.w <= 0 && ct.reveal >= 1)) {
+      state = "won"; endTimer = 0; saved.set(level % TOTAL + 1);
+    }
+  } else if (nextBtn.classList.contains("hidden") && (endTimer += dt) > 0.8) {
+    nextBtn.classList.remove("hidden"); hint.classList.add("hidden");
+  }
+}
+
+// ---------- layout ----------
+let W, H, dpr, safeTop = 0, wall = {}, cards = [], dry = {}, wide = false, sc = 1;
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = Math.min(3, window.devicePixelRatio || 1);
+  safeTop = safeProbe.offsetHeight || 0;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = W + "px"; cv.style.height = H + "px";
+  const n = L.shapes.length, g = 10, top = safeTop + 46, hintH = level === 1 ? 46 : 12, ctrl = 48;
+  wide = W > H * 1.05 && W >= 640;
+  let ww, cw, perRow, x0;
+  if (!wide) {
+    perRow = 4; const rows = Math.ceil(n / perRow);
+    // wall: 1.2 ww tall; a card is cw = (ww - 3g) / 4 wide and (cw - 10) * 1.2 + 10 tall = 0.3 ww - 11 (g = 10)
+    const fixed = top + 10 + ctrl + 12 + hintH + 8 + (rows - 1) * g - 11 * rows;
+    ww = Math.min(W - 24, 520, (H - fixed) / (1.2 + 0.3 * rows));
+    ww = Math.max(160, Math.floor(ww));
+    x0 = Math.round((W - ww) / 2);
+    const spare = H - (fixed + ww * (1.2 + 0.3 * rows));
+    wall = { x: x0, y: top + Math.max(0, Math.round(spare * 0.3)), w: ww, h: ww * 1.2 };
+    const cy = wall.y + wall.h + 10;
+    place3(x0, cy, ww);
+    cw = (ww - 3 * g) / 4;
+    let y = cy + ctrl + 12;
+    cards = [];
+    for (let i = 0; i < n; i++) {
+      const r = (i / perRow) | 0, c = i % perRow, inRow = Math.min(perRow, n - r * perRow);
+      const rowX = x0 + (ww - (inRow * cw + (inRow - 1) * g)) / 2;
+      cards.push({ x: rowX + c * (cw + g), y: y + r * ((cw - 10) * 1.2 + 10 + g), w: cw, h: (cw - 10) * 1.2 + 10 });
+    }
+    const last = cards[n - 1];
+    hint.style.top = (last.y + last.h + 10) + "px";
+  } else {
+    const wh = Math.min(H - top - 16, 760); ww = Math.floor(wh / 1.2);
+    const side = Math.min(300, Math.max(200, W - ww - 60));
+    perRow = 2; const rows = Math.ceil(n / 2);
+    cw = (side - g) / 2;
+    const avail = H - top - ctrl - 12 - hintH - 8;
+    const ch0 = (cw - 10) * 1.2 + 10;
+    if (rows * (ch0 + g) > avail) cw = ((avail / rows - g - 10) / 1.2) + 10;
+    const sw = Math.max(side, 2 * cw + g);
+    x0 = Math.round((W - (ww + 28 + sw)) / 2);
+    wall = { x: x0, y: top, w: ww, h: ww * 1.2 };
+    const sx = x0 + ww + 28;
+    place3(sx, top, sw);
+    cards = [];
+    for (let i = 0; i < n; i++) {
+      const r = (i / 2) | 0, c = i % 2, h = (cw - 10) * 1.2 + 10;
+      cards.push({ x: sx + c * (cw + g), y: top + ctrl + 12 + r * (h + g), w: cw, h });
+    }
+    const last = cards[n - 1];
+    hint.style.top = (last.y + last.h + 12) + "px";
+    hint.style.left = sx + "px"; hint.style.right = (W - sx - sw) + "px";
+  }
+  if (!wide) { hint.style.left = wall.x + "px"; hint.style.right = (W - wall.x - wall.w) + "px"; }
+  sc = wall.w / WU;
+  nextBtn.style.left = (wall.x + wall.w / 2 - 52) + "px";
+  nextBtn.style.top = (wall.y + wall.h / 2 - 22) + "px";
+  lvlLabel.style.right = (12 + speedBtn.offsetWidth + 14) + "px";
+  makeLayers();
+}
+// the row of controls: undo and restart on the left, the hairdryer on the right
+function place3(x, y, w) {
+  undoBtn.style.left = x + "px"; undoBtn.style.top = y + "px";
+  restartBtn.style.left = (x + undoBtn.offsetWidth + 10) + "px"; restartBtn.style.top = y + "px";
+  dry = { x: x + w - 64, y, w: 64, h: 48 };
+  Object.assign(dryerBtn.style, { left: dry.x + "px", top: dry.y + "px", width: dry.w + "px", height: dry.h + "px" });
+}
+
+// ---------- drawing layers ----------
+let plaster, texture, base, guide;
+function layer() { const c = document.createElement("canvas"); c.width = Math.round(wall.w * dpr); c.height = Math.round(wall.h * dpr); return c; }
+function wallCtx(c) { const g = c.getContext("2d"); g.setTransform(dpr * sc, 0, 0, dpr * sc, 0, 0); return g; }
+function makeLayers() {
+  // grain: the plaster's fine speckle, reused under matte paint
+  texture = layer();
+  let g = texture.getContext("2d");
+  g.fillStyle = "#fff"; g.fillRect(0, 0, texture.width, texture.height);
+  const keep = seed; seed = 777;
+  const dots = Math.round(texture.width * texture.height / 34);
+  for (let i = 0; i < dots; i++) {
+    const v = 224 + Math.floor(rnd() * 28);
+    g.fillStyle = `rgb(${v},${v - 3},${v - 8})`;
+    g.fillRect(rnd() * texture.width, rnd() * texture.height, 1 + rnd() * dpr, 1 + rnd() * dpr);
+  }
+  seed = keep;
+  // plaster lit by a lamp at the upper left, with the faint mural sketched on it
+  plaster = layer();
+  g = wallCtx(plaster);
+  const lg = g.createRadialGradient(18, 8, 4, 30, 30, 150);
+  lg.addColorStop(0, "#d8c8ac"); lg.addColorStop(0.6, "#c4b294"); lg.addColorStop(1, "#a8967a");
+  g.fillStyle = lg; g.fillRect(0, 0, WU, HU);
+  g.globalCompositeOperation = "multiply"; g.drawImage(texture, 0, 0, WU, HU); g.globalCompositeOperation = "source-over";
+  const sketch = layer(), sg = wallCtx(sketch);
+  for (const s of L.shapes) { sg.fillStyle = css(PAINTS[s.col]); sg.fill(s.path); }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 0.4; g.drawImage(sketch, 0, 0); g.globalAlpha = 1;
+  g.setTransform(dpr * sc, 0, 0, dpr * sc, 0, 0);
+  g.strokeStyle = "rgba(70,52,38,0.28)"; g.lineWidth = 0.35;   // pencil lines round each part of the mural
+  for (const s of L.shapes) { g.save(); g.clip(s.path); g.stroke(s.path); g.restore(); }
+  base = layer(); guide = layer();
+  baseDirty = guideDirty = true;
+}
+
+// the dry coats at the bottom of the stack are kept as one picture; only wet coats are drawn every frame
+function rebuildBase() {
+  let k = 0;
+  while (k < coats.length && coats[k].w <= 0 && coats[k].reveal >= 1) k++;
+  baseCount = k;
+  const g = base.getContext("2d");
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, base.width, base.height); g.drawImage(plaster, 0, 0);
+  g.setTransform(dpr * sc, 0, 0, dpr * sc, 0, 0);
+  for (let i = 0; i < k; i++) drawCoat(g, coats[i]);
+  baseDirty = false;
+}
+
+// where the paint differs from the mural: fine hatching in the colour that belongs there
+function rebuildGuide() {
+  const g = guide.getContext("2d");
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, guide.width, guide.height);
+  g.setTransform(dpr * sc, 0, 0, dpr * sc, 0, 0);
+  const topF = new Int8Array(FX * FY).fill(-1), paths = new Map(), r = CU / FU;
+  coats.forEach((ct, i) => { const m = L.shapes[ct.k].fine; for (let f = 0; f < FX * FY; f++) if (m[f]) topF[f] = i; });
+  const wantAt = f => {                                  // the colour that belongs here, when the paint differs from it
+    const t = topF[f]; if (t < 0) return -1;
+    const want = L.targetF[f], ct = coats[t];
+    if (want < 0) return -1;
+    const c = ((f / FX | 0) / r | 0) * GX + ((f % FX) / r | 0);
+    return ct.k !== want || (ct.smearSet && ct.smearSet[c]) ? want : -1;
+  };
+  for (let y = 0; y < FY; y++) {                         // runs along each row, one rectangle per run
+    let x = 0;
+    while (x < FX) {
+      const k = wantAt(y * FX + x); let e = x + 1;
+      while (e < FX && wantAt(y * FX + e) === k) e++;
+      if (k >= 0) { if (!paths.has(k)) paths.set(k, new Path2D()); paths.get(k).rect(x * FU, y * FU - 0.02, (e - x) * FU, FU + 0.04); }
+      x = e;
+    }
+  }
+  for (const [k, p] of paths) {
+    g.save(); g.clip(p);
+    g.beginPath();
+    for (let d = 0; d < WU + HU; d += 3) { g.moveTo(d, 0); g.lineTo(d - HU, HU); }
+    g.strokeStyle = "rgba(25,16,10,0.32)"; g.lineWidth = 1.1; g.stroke();
+    g.strokeStyle = css(PAINTS[L.shapes[k].col]); g.lineWidth = 0.6; g.stroke();
+    g.restore();
+  }
+  guideDirty = false;
+}
+
+const ease = t => t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+const hash = (a, b) => { let h = Math.imul(a ^ 0x27d4eb2d, 0x165667b1) ^ Math.imul(b + 0x9e37, 0x85ebca6b); h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d); h ^= h >>> 12; return (h >>> 0) / 4294967296; };
+
+// one coat: flat colour that is darker and glossy while wet, then matte with the plaster's grain
+function drawCoat(g, ct) {
+  const sh = L.shapes[ct.k], col = PAINTS[sh.col], w = ct.w;
+  g.save();
+  if (ct.reveal < 1) {                                   // the brush on its way down
+    const e = ease(ct.reveal);
+    g.beginPath(); g.rect(-2, -2, WU + 4, sh.y0 + (sh.y1 - sh.y0 + 2) * e + 2); g.clip();
+  }
+  g.save(); g.clip(sh.path);
+  g.fillStyle = css(col); g.fillRect(0, 0, WU, HU);
+  if (w < 1) {
+    g.globalAlpha = (1 - w) * 0.85; g.globalCompositeOperation = "multiply";
+    g.drawImage(texture, 0, 0, WU, HU);
+    g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+  }
+  if (ct.smear) {                                        // wet on wet: soft streaks of the colour underneath
+    for (let i = 0; i < ct.smear.length; i += 2) {
+      const c = ct.smear[i], under = PAINTS[L.shapes[ct.smear[i + 1]].col];
+      const x = (c % GX) * CU + 1, y = ((c / GX) | 0) * CU + 1;
+      for (let j = 0; j < 2; j++) {
+        const h1 = hash(c, j), h2 = hash(c + 7919, j), h3 = hash(c, j + 31);
+        if (h3 < 0.35) continue;
+        g.fillStyle = css(mix(under, col, 0.4 + h1 * 0.35), 0.6);
+        g.beginPath(); g.ellipse(x + (h2 - 0.5) * 1.8, y + (h3 - 0.5) * 1.8, 1.1 + h1 * 0.7, 2.2 + h2 * 1.4, (h3 - 0.5) * 0.6, 0, 7); g.fill();
+      }
+    }
+  }
+  if (w > 0) {
+    g.fillStyle = `rgba(22,10,4,${0.22 * w})`; g.fillRect(0, 0, WU, HU);          // wet paint reads darker
+    const glare = g.createRadialGradient(16, 6, 2, 16, 6, 110);                    // the lamp reflected in it
+    glare.addColorStop(0, `rgba(255,246,226,${0.34 * w})`); glare.addColorStop(1, "rgba(255,246,226,0)");
+    g.fillStyle = glare; g.fillRect(0, 0, WU, HU);
+    const pos = calm ? 0.35 : (clock / 11 + ct.phase) % 1;                         // a slow sheen sliding across
+    const s = -40 + pos * 230, dx = 0.82, dy = 0.57;
+    const band = g.createLinearGradient((s - 16) * dx, (s - 16) * dy, (s + 16) * dx, (s + 16) * dy);
+    band.addColorStop(0, "rgba(255,250,236,0)"); band.addColorStop(0.5, `rgba(255,250,236,${0.42 * w})`); band.addColorStop(1, "rgba(255,250,236,0)");
+    g.fillStyle = band; g.fillRect(0, 0, WU, HU);
+    g.strokeStyle = `rgba(255,248,232,${0.35 * w})`; g.lineWidth = 0.7; g.stroke(sh.path);   // a wet rim
+  }
+  g.restore();
+  for (const d of ct.drips) {                            // drips run a little way down and stay
+    if (d.len <= 0.05) continue;
+    const dc = mix(col, [22, 10, 4], 0.2 * w);
+    g.strokeStyle = css(dc); g.lineWidth = d.wd; g.lineCap = "round";
+    g.beginPath(); g.moveTo(d.x, d.y); g.lineTo(d.x, d.y + d.len); g.stroke();
+    g.fillStyle = css(dc); g.beginPath(); g.arc(d.x, d.y + d.len, d.wd * 0.75, 0, 7); g.fill();
+    if (w > 0) { g.fillStyle = `rgba(255,248,232,${0.45 * w})`; g.beginPath(); g.arc(d.x - d.wd * 0.2, d.y + d.len - d.wd * 0.2, d.wd * 0.22, 0, 7); g.fill(); }
+  }
+  g.restore();
+}
+
+function rrect(g, x, y, w, h, r) { g.beginPath(); g.roundRect ? g.roundRect(x, y, w, h, r) : g.rect(x, y, w, h); }
+
+function drawCard(i) {
+  const k = L.tray[i], r = cards[i], sh = L.shapes[k], done = used(k);
+  rrect(ctx, r.x, r.y, r.w, r.h, 7);
+  ctx.fillStyle = done ? "#2f231b" : "#3d2d22"; ctx.fill();
+  ctx.strokeStyle = done ? "#4e3d30" : "#7a6350"; ctx.lineWidth = 1.5; ctx.stroke();
+  const mx = r.x + 5, my = r.y + 5, mw = r.w - 10, mh = r.h - 10, ms = mw / WU;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(mx, my, mw, mh); ctx.clip();
+  ctx.fillStyle = done ? "#4a3b2f" : "#cdbb9e"; ctx.fillRect(mx, my, mw, mh);
+  ctx.translate(mx, my); ctx.scale(ms, ms);
+  if (done) {
+    ctx.fillStyle = css(PAINTS[sh.col], 0.3); ctx.fill(sh.path);
+  } else {
+    ctx.fillStyle = css(PAINTS[sh.col]); ctx.fill(sh.path);
+  }
+  ctx.restore();
+  if (!done && state === "play" && wouldSmear(k)) {     // a drop: this stencil would go over wet paint
+    const x = r.x + r.w - 12, y = r.y + 14, s = 6;
+    ctx.beginPath(); ctx.moveTo(x, y - s * 1.5);
+    ctx.bezierCurveTo(x + s * 0.4, y - s * 0.6, x + s, y - s * 0.1, x + s, y + s * 0.35);
+    ctx.arc(x, y + s * 0.35, s, 0, Math.PI, false);
+    ctx.bezierCurveTo(x - s, y - s * 0.1, x - s * 0.4, y - s * 0.6, x, y - s * 1.5);
+    ctx.fillStyle = "#e9f1f4"; ctx.fill(); ctx.strokeStyle = "#1f2a33"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+}
+
+// the hairdryer: a little peach dryer; the fan turns and warm air blows while it runs
+function drawDryer() {
+  const on = blow > 0, cx = dry.x + dry.w / 2 + 4, cy = dry.y + dry.h / 2 - 1, s = 46;
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(wide ? -0.12 : -0.42);
+  if (on) {                                              // air: soft wavy lines leaving the nozzle
+    ctx.strokeStyle = "#f6e6cc"; ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.lineJoin = "round";
+    for (let i = 0; i < 3; i++) {
+      const ph = calm ? 0.4 : (clock * 1.2 + i / 3) % 1, x0 = -s * 0.52 - ph * s * 0.6, a = Math.min(1, (1 - ph) * 1.6);
+      ctx.globalAlpha = a * 0.85;
+      ctx.beginPath();
+      for (let j = 0; j <= 8; j++) { const y = (i - 1) * s * 0.16 + Math.sin(j * 1.1 - clock * 6 + i) * 1.8; const x = x0 - j * 1.8; j ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  ctx.fillStyle = "#c9967d"; ctx.strokeStyle = "#2a1c15"; ctx.lineWidth = 1.5;
+  rrect(ctx, s * 0.0, s * 0.02, s * 0.17, s * 0.42, s * 0.06); ctx.fill(); ctx.stroke();          // handle
+  rrect(ctx, -s * 0.52, -s * 0.09, s * 0.18, s * 0.18, s * 0.03); ctx.fillStyle = "#b07f69"; ctx.fill(); ctx.stroke(); // nozzle
+  rrect(ctx, -s * 0.36, -s * 0.15, s * 0.6, s * 0.3, s * 0.14); ctx.fillStyle = "#e8b89c"; ctx.fill(); ctx.stroke(); // barrel
+  ctx.beginPath(); ctx.arc(s * 0.27, 0, s * 0.16, 0, 7); ctx.fillStyle = "#d9a487"; ctx.fill(); ctx.stroke();      // back
+  ctx.save(); ctx.translate(s * 0.27, 0); ctx.rotate(fan);
+  ctx.strokeStyle = "#5b3e30"; ctx.lineWidth = 1.4;
+  ctx.beginPath(); for (let b = 0; b < 3; b++) { const a = b * 2.094; ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * s * 0.11, Math.sin(a) * s * 0.11); } ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = on ? "#ffd27a" : "#6b4b3b"; ctx.beginPath(); ctx.arc(-s * 0.06, -s * 0.06, s * 0.035, 0, 7); ctx.fill(); // the little light
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = ROOM; ctx.fillRect(0, 0, W, H);
+  const room = ctx.createRadialGradient(wall.x + wall.w * 0.2, wall.y, 10, wall.x + wall.w * 0.4, wall.y + wall.h * 0.4, Math.max(W, H) * 0.8);
+  room.addColorStop(0, "rgba(120,80,48,0.35)"); room.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = room; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(0,0,0,0.35)"; ctx.fillRect(wall.x + 3, wall.y + 4, wall.w, wall.h);   // the panel's shadow
+  if (baseDirty) rebuildBase();
+  if (guideDirty) rebuildGuide();
+  ctx.drawImage(base, wall.x, wall.y, wall.w, wall.h);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(wall.x, wall.y, wall.w, wall.h); ctx.clip();
+  ctx.setTransform(dpr * sc, 0, 0, dpr * sc, dpr * wall.x, dpr * wall.y);
+  for (let i = baseCount; i < coats.length; i++) drawCoat(ctx, coats[i]);
+  ctx.restore();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.drawImage(guide, wall.x, wall.y, wall.w, wall.h);
+  // masking tape round the panel
+  ctx.fillStyle = "#d8c592";
+  const t = 5;
+  ctx.fillRect(wall.x - t, wall.y - t, wall.w + 2 * t, t); ctx.fillRect(wall.x - t, wall.y + wall.h, wall.w + 2 * t, t);
+  ctx.fillRect(wall.x - t, wall.y, t, wall.h); ctx.fillRect(wall.x + wall.w, wall.y, t, wall.h);
+  for (let i = 0; i < cards.length; i++) drawCard(i);
+  drawDryer();
+}
+
+// ---------- input ----------
+cv.addEventListener("pointerdown", e => {
+  if (state !== "play") return;
+  const x = e.clientX, y = e.clientY;
+  for (let i = 0; i < cards.length; i++) {
+    const r = cards[i];
+    if (x >= r.x - 4 && x <= r.x + r.w + 4 && y >= r.y - 4 && y <= r.y + r.h + 4) { paint(L.tray[i]); return; }
+  }
+});
+undoBtn.addEventListener("click", undo);
+restartBtn.addEventListener("click", restart);
+dryerBtn.addEventListener("click", () => { blow = BLOW; });
+nextBtn.addEventListener("click", () => newLevel(level % TOTAL + 1));
+speedBtn.addEventListener("click", () => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  speedBtn.textContent = SPEEDS[speedIdx] + "×";
+  lvlLabel.style.right = (12 + speedBtn.offsetWidth + 14) + "px";
+});
+addEventListener("resize", () => { layout(); });
+
+// ---------- loop ----------
+let last = 0;
+function frame(t) {
+  const dt = Math.min(0.05, (t - last) / 1000);
+  if (t - last >= 30) {                                     // about 30 frames a second is plenty
+    last = t;
+    for (let i = 0; i < SPEEDS[speedIdx]; i++) update(dt);   // faster = more steps per frame, same rules
+    draw();
+  }
+  requestAnimationFrame(frame);
+}
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>

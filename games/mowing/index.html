@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1e2a36">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Mowing</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #1e2a36; overflow: hidden;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; }
+  button { font: 15px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em;
+    color: #e6eef0; background: #253545; border: 1px solid #5b7689; border-radius: 6px;
+    width: 104px; padding: 14px 0; cursor: pointer; }
+  button:active { background: #1b2734; }
+  button:focus-visible { outline: 2px solid #e6eef0; outline-offset: 3px; }
+  #home { position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 12px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #9db2bf; text-decoration: none;
+    padding: 6px 4px; }
+  #home:focus-visible { outline: 2px solid #e6eef0; outline-offset: 3px; }
+  #lvl { position: fixed; height: 44px; line-height: 44px; font: 13px ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .08em; color: #b3c4cf; }
+  #speed { position: fixed; width: auto; min-width: 52px; height: 44px; padding: 0 14px; font-size: 13px; }
+  #hint { position: fixed; left: 0; right: 0; text-align: center; font: 13px/1.7 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .05em; color: #9db2bf; pointer-events: none; }
+  #end { position: fixed; left: 0; right: 0; display: flex; justify-content: center; pointer-events: none; }
+  #end button { pointer-events: auto; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="lvl"></div>
+<button id="speed">1×</button>
+<div id="hint"></div>
+<div id="end" class="hidden"><button id="next">next</button></div>
+<script>
+"use strict";
+// ---------- settings ----------
+const TOTAL = 250;
+const SPEED = 2.2;            // mower pace, in cells per second
+const P = 10, B = 4;          // picture pixels per lawn cell, pixels of hedge around the lawn
+const BG = "#1e2a36";
+
+// colours (rgb arrays for the pixel picture)
+const TALL_A = [44, 104, 52], TALL_B = [40, 96, 48], TUFT_L = [74, 142, 68], TUFT_D = [30, 80, 40];
+const CUT_L = [152, 208, 106], CUT_L2 = [142, 199, 98], CUT_D = [100, 162, 76], CUT_D2 = [93, 153, 70];
+const HEDGE = [30, 72, 45], HEDGE_L = [44, 96, 58], HEDGE_D = [20, 50, 32];
+const TREE = [30, 80, 52], TREE_L = [70, 138, 84], TREE_D = [14, 40, 28], APPLE = [222, 82, 66];
+const SOIL = [96, 62, 44], SOIL_D = [74, 47, 33], SOIL_E = [58, 36, 25], LEAF = [64, 136, 64];
+const FLOWERS = [[244, 156, 186], [246, 212, 102], [242, 238, 226], [196, 150, 236]];
+const WATER = [48, 98, 152], WATER_L = [104, 156, 202], WATER_D = [36, 74, 122], RIM = [146, 146, 132], LILY = [74, 154, 84];
+const ROOF = [134, 80, 52], ROOF_L = [166, 108, 72], ROOF_D = [100, 58, 38], ROOF_E = [62, 37, 26];
+const SLAB = [154, 154, 144], SLAB_D = [112, 112, 104], SLAB_L = [176, 176, 166];
+const SHADOW = [0, 0, 0, 0.28];
+
+// the mower, facing right (front on the right), 10 x 10 picture pixels
+const MOWER = [
+  "..........",
+  "k...ww.ww.",
+  "k..rrrrrr.",
+  "k.rRRRrrrd",
+  "kkrRggggrd",
+  "kkrrgyygrd",
+  "k.rrggggrd",
+  "k..ddddddd",
+  "k...ww.ww.",
+  "..........",
+];
+const MOWER_COL = { k: [58, 58, 64], w: [26, 26, 28], r: [226, 76, 60], R: [246, 128, 104], d: [172, 50, 40],
+  g: [186, 190, 186], y: [246, 200, 84] };
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const endBox = document.getElementById("end");
+const nextBtn = document.getElementById("next");
+const speedBtn = document.getElementById("speed");
+const lvlLabel = document.getElementById("lvl");
+const hintBox = document.getElementById("hint");
+const SPEEDS = [1, 2, 3, 5];
+let speedIdx = 0;
+const reduceMotion = (() => { try { return matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; } })();
+
+// ---------- seeded random ----------
+let seed = 0;
+function rnd() { // mulberry32
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+
+// ---------- numbered levels: level n always builds the same lawn ----------
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+const saved = {                  // progress, kept in this browser only
+  get() { try { return parseInt(localStorage.getItem("mowing.level"), 10) || 1; } catch (e) { return 1; } },
+  set(n) { try { localStorage.setItem("mowing.level", String(n)); } catch (e) {} },
+};
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+
+// ---------- the garden ----------
+// kind: 0 lawn, 1 paving slab (the mower's start), 2 something in the way
+let COLS, ROWS, kind, objId, objects, SLAB_CELL, LAWN, R, SOL, tufts, startFace;
+const isLawn = i => kind[i] === 0;
+const drivable = i => i >= 0 && kind[i] !== 2;
+function nbrs(i) {
+  const x = i % COLS, y = (i / COLS) | 0, out = [];
+  if (x + 1 < COLS) out.push(i + 1); if (x > 0) out.push(i - 1);
+  if (y + 1 < ROWS) out.push(i + COLS); if (y > 0) out.push(i - COLS);
+  return out;
+}
+const adjacent = (a, b) => { const dx = Math.abs(a % COLS - b % COLS), dy = Math.abs(((a / COLS) | 0) - ((b / COLS) | 0)); return dx + dy === 1; };
+
+// a covering walk from the slab over every lawn cell, each cell once: depth first, fewest exits first, with pruning
+function coverWalk(start, budget) {
+  const n = COLS * ROWS, vis = new Uint8Array(n), nb = [];
+  let left = 0;
+  for (let i = 0; i < n; i++) { nb[i] = nbrs(i).filter(isLawn); if (isLawn(i)) left++; }
+  vis[start] = 1;
+  const path = [start], q = new Int32Array(n), seen = new Uint8Array(n);
+  let best = [start], nodes = 0, aborted = false;
+  const deg = u => { let d = 0; for (const v of nb[u]) if (!vis[v]) d++; return d; };
+  function ok(head) {
+    if (left === 0) return true;
+    let ends = 0, from = -1;
+    for (let u = 0; u < n; u++) {
+      if (!isLawn(u) || vis[u]) continue;
+      const d = deg(u), adj = nb[head].includes(u);
+      if (d === 0) { if (!adj || left > 1) return false; }
+      else if (d === 1 && !adj && ++ends > 1) return false;
+      if (adj) from = u;
+    }
+    if (from < 0) return false;
+    seen.fill(0); let h = 0, t = 0, got = 1; q[t++] = from; seen[from] = 1;
+    while (h < t) { const u = q[h++]; for (const v of nb[u]) if (!vis[v] && !seen[v]) { seen[v] = 1; got++; q[t++] = v; } }
+    return got === left;
+  }
+  function dfs(head) {
+    if (left === 0) return true;
+    if (++nodes > budget) { aborted = true; return false; }
+    const cand = nb[head].filter(v => !vis[v]).map(v => [v, deg(v) + rnd() * 0.9]).sort((a, b) => a[1] - b[1]);
+    for (const [v] of cand) {
+      vis[v] = 1; left--; path.push(v);
+      if (path.length > best.length) best = path.slice();
+      if (ok(v) && dfs(v)) return true;
+      vis[v] = 0; left++; path.pop();
+      if (aborted) return false;
+    }
+    return false;
+  }
+  const full = start >= 0 && dfs(start);
+  return full ? path.slice() : best;
+}
+
+const SHAPES = {
+  pond: [[[0, 0], [1, 0], [0, 1], [1, 1]], [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1], [2, 1]],
+    [[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2]], [[0, 0], [1, 0], [0, 1]], [[0, 0], [1, 0], [1, 1]]],
+  bed: [[[0, 0], [1, 0]], [[0, 0], [0, 1]], [[0, 0], [1, 0], [2, 0]], [[0, 0], [0, 1], [0, 2]]],
+  tree: [[[0, 0]]],
+};
+
+function tryLayout(cols, rows, extra) {
+  COLS = cols; ROWS = rows;
+  const n = cols * rows;
+  kind = new Int8Array(n); objId = new Int16Array(n).fill(-1); objects = [];
+  const place = (type, cells) => { const id = objects.length; objects.push({ type, cells }); for (const i of cells) { kind[i] = 2; objId[i] = id; } };
+  // the shed sits in a corner, the slab in front of it
+  const corner = ri(0, 3), sx = corner & 1 ? cols - 2 : 0, sy = corner & 2 ? rows - 2 : 0;
+  place("shed", [sy * cols + sx, sy * cols + sx + 1, (sy + 1) * cols + sx, (sy + 1) * cols + sx + 1]);
+  const around = [];
+  for (const i of objects[0].cells) for (const v of nbrs(i)) if (kind[v] === 0 && !around.includes(v)) around.push(v);
+  SLAB_CELL = around[ri(0, around.length - 1)];
+  kind[SLAB_CELL] = 1;
+  // trees, flower beds and a pond; lanes one cell wide between them are mostly left out
+  const blocked = (x, y) => x < 0 || y < 0 || x >= cols || y >= rows || kind[y * cols + x] === 2;
+  const corridors = () => { let k = 0; for (let i = 0; i < n; i++) if (kind[i] === 0) {
+    const x = i % cols, y = (i / cols) | 0;
+    if ((blocked(x - 1, y) && blocked(x + 1, y)) || (blocked(x, y - 1) && blocked(x, y + 1))) k++; } return k; };
+  let want = extra, tries = 0, pond = false;
+  while (want > 0 && tries++ < 300) {
+    let type = "tree";
+    const r = rnd();
+    if (!pond && n >= 30 && want >= 3 && r < 0.45) type = "pond";
+    else if (want >= 2 && r < 0.75) type = "bed";
+    const shapes = SHAPES[type], sh = shapes[ri(0, shapes.length - 1)];
+    const x0 = ri(0, cols - 1), y0 = ri(0, rows - 1), cells = [];
+    let fits = true;
+    for (const [dx, dy] of sh) {
+      const x = x0 + dx, y = y0 + dy;
+      if (x >= cols || y >= rows || kind[y * cols + x] !== 0) { fits = false; break; }
+      cells.push(y * cols + x);
+    }
+    if (!fits) continue;
+    if (cells.some(i => nbrs(i).some(v => kind[v] === 2 && objects[objId[v]].type !== type) && rnd() < 0.7)) continue; // keep things spaced
+    place(type, cells);
+    if (!nbrs(SLAB_CELL).some(isLawn) || (corridors() > 0 && rnd() < 0.9)) { for (const i of cells) { kind[i] = 0; objId[i] = -1; } objects.pop(); continue; }
+    if (type === "pond") pond = true;
+    want -= cells.length;
+  }
+  // a lawn cell with one way in can only be where the route ends: keep at most one such pocket
+  const pockets = () => { const a = []; for (let i = 0; i < n; i++) if (isLawn(i) && nbrs(i).filter(drivable).length <= 1) a.push(i); return a; };
+  for (let fix = 0; ; fix++) {
+    const pk = pockets();
+    if (pk.length <= 1) break;
+    if (fix >= 4) return null;
+    place("tree", [pk[ri(0, pk.length - 1)]]);
+  }
+  // a route that visits each cell once alternates the two checkerboard colours: balance them with a tree or two
+  const colour = i => ((i % cols) + ((i / cols) | 0)) & 1, sc = colour(SLAB_CELL);
+  for (let fix = 0; ; fix++) {
+    const away = [], same = [];
+    for (let i = 0; i < n; i++) if (isLawn(i)) (colour(i) === sc ? same : away).push(i);
+    let pool = null;
+    if (away.length > same.length + 1) pool = away; else if (same.length > away.length) pool = same;
+    if (!pool) break;
+    if (fix >= 3) return null;
+    const ok = pool.filter(i => !adjacent(i, SLAB_CELL) || nbrs(SLAB_CELL).filter(isLawn).length > 1);
+    if (!ok.length) return null;
+    place("tree", [ok[ri(0, ok.length - 1)]]);
+  }
+  let lawnCount = 0; for (let i = 0; i < n; i++) if (isLawn(i)) lawnCount++;
+  if (pockets().length > 1 || !nbrs(SLAB_CELL).some(isLawn)) return null;
+  { // all the lawn in one piece
+    const seen = new Uint8Array(n), q = [SLAB_CELL]; seen[SLAB_CELL] = 1; let got = 0;
+    while (q.length) { const u = q.pop(); for (const v of nbrs(u)) if (isLawn(v) && !seen[v]) { seen[v] = 1; got++; q.push(v); } }
+    if (got !== lawnCount) return null;
+  }
+  let walk = [];
+  for (let run = 0; run < 4 && walk.length - 1 < lawnCount; run++) {   // a few short searches beat one long one
+    const w = coverWalk(SLAB_CELL, 2500);
+    if (w.length > walk.length) walk = w;
+  }
+  const missed = lawnCount - (walk.length - 1);
+  if (missed > 0) {   // a few cells the walk left out become trees or flower beds, if they are few and small
+    if (missed > Math.max(2, Math.round(lawnCount * 0.05))) return null;
+    const on = new Uint8Array(n); for (const i of walk) on[i] = 1;
+    const left = [];
+    for (let i = 0; i < n; i++) if (isLawn(i) && !on[i]) left.push(i);
+    const done = new Uint8Array(n);
+    for (const i of left) {
+      if (done[i]) continue;
+      const comp = [i]; done[i] = 1;
+      for (let k = 0; k < comp.length; k++) for (const v of nbrs(comp[k])) if (isLawn(v) && !on[v] && !done[v]) { done[v] = 1; comp.push(v); }
+      if (comp.length > 3) return null;
+      place(comp.length === 1 ? "tree" : "bed", comp);
+    }
+  }
+  return walk;
+}
+
+function genLevel(n) {
+  seed = seedFor(n);
+  const t = (n - 1) / (TOTAL - 1), hard = n >= 5 && n % 5 === 0;
+  const cols = Math.min(8, 4 + Math.floor(4.4 * Math.pow(t, 0.7) + rnd() * 0.7) + (hard ? 1 : 0));
+  const rows = Math.min(12, cols + 1 + ri(0, 1) + (hard ? 1 : 0));
+  const frac = 0.03 + 0.13 * Math.pow(t, 0.8) + (hard ? 0.05 : 0);
+  let walk = null;
+  for (let attempt = 0; !walk; attempt++) {
+    const extra = Math.round((cols * rows - 5) * frac * (attempt < 20 ? 1 : 0.5) + rnd() * 0.8);
+    walk = tryLayout(cols, rows, attempt < 40 ? extra : 0);
+  }
+  SOL = walk;
+  LAWN = []; for (let i = 0; i < COLS * ROWS; i++) if (isLawn(i)) LAWN.push(i);
+  const slackFrac = (0.5 - 0.44 * Math.pow(t, 0.6)) * (hard ? 0.25 : 1);
+  R = LAWN.length + Math.round(LAWN.length * slackFrac);
+  // tall grass tufts, fixed for each cell
+  tufts = LAWN.map(() => { const a = []; for (let k = 0; k < 9; k++) a.push([ri(0, P - 1), ri(0, P - 2), rnd() < 0.6]); return a; });
+  const ways = nbrs(SLAB_CELL).filter(isLawn);
+  startFace = dirOf(SLAB_CELL, ways[ri(0, ways.length - 1)]);
+}
+
+// ---------- level state ----------
+// hist: cells the mower has driven through (hist[0] is the slab); step k cut hist[k]
+// plan: cells drawn ahead of the mower; undo: steps of hist the mower still has to back out of
+let hist, prevCut, prevDir, cutAt, cutDir, plan, undo, m, face, state, endTimer, lawnIndex;
+const dirOf = (a, b) => b === a + 1 ? 0 : b === a - 1 ? 2 : b > a ? 1 : 3;   // 0 right, 1 down, 2 left, 3 up
+
+// the next lawn is laid out while the player looks at the finished one
+const snapshot = () => ({ COLS, ROWS, kind, objId, objects, SLAB_CELL, LAWN, R, SOL, tufts, startFace });
+function restore(o) { ({ COLS, ROWS, kind, objId, objects, SLAB_CELL, LAWN, R, SOL, tufts, startFace } = o); }
+let ready = null;
+function prepare(n) {
+  if (ready && ready.n === n) return;
+  const now = snapshot(); genLevel(n); ready = { n, lawn: snapshot() }; restore(now);
+}
+
+function newLevel(n) {
+  level = n;
+  lvlLabel.textContent = n + " / " + TOTAL;
+  if (ready && ready.n === n) restore(ready.lawn); else genLevel(n);
+  ready = null;
+  lawnIndex = new Int16Array(COLS * ROWS).fill(-1); LAWN.forEach((i, k) => lawnIndex[i] = k);
+  cutAt = new Float64Array(COLS * ROWS).fill(-1e9); cutDir = new Int8Array(COLS * ROWS);
+  hist = [SLAB_CELL]; prevCut = [0]; prevDir = [0]; plan = []; undo = 0; m = 1; face = startFace;
+  state = "play"; endTimer = 0;
+  endBox.classList.add("hidden");
+  buildBase();
+  layout();
+  setHint();
+}
+function setHint() {
+  let s = LAWN.length + " squares of lawn<br>grass grows back after " + R + " steps";
+  if (level <= 3 && hist.length === 1 && !plan.length) s += "<br>drag a path from the mower";
+  hintBox.innerHTML = s;
+}
+
+// the route as the player sees it: driven steps still kept, then the drawn plan
+const routeLen = () => hist.length - undo + plan.length;
+const routeAt = j => j < hist.length - undo ? hist[j] : plan[j - (hist.length - undo)];
+const routeEnd = () => routeAt(routeLen() - 1);
+function routeLast(cell) { for (let j = routeLen() - 1; j >= 0; j--) if (routeAt(j) === cell) return j; return -1; }
+function truncate(j) {       // keep route[0..j]
+  const kept = hist.length - undo;
+  if (j >= kept - 1) plan.length = j - kept + 1;
+  else { plan.length = 0; undo = hist.length - 1 - j; }
+}
+function extend(cell) {      // one step from the route end: back onto the cell before it undoes, anything else adds
+  if (state !== "play" || !drivable(cell) || !adjacent(cell, routeEnd())) return false;
+  const L = routeLen();
+  if (L >= 2 && routeAt(L - 2) === cell) {
+    if (plan.length) plan.pop(); else undo++;
+  } else plan.push(cell);
+  setHint();
+  return true;
+}
+
+// ---------- the mower ----------
+function step() {            // start driving into the next planned cell
+  const cell = plan.shift(), k = hist.length;
+  face = dirOf(hist[k - 1], cell);
+  prevCut.push(cutAt[cell]); prevDir.push(cutDir[cell]);
+  if (isLawn(cell)) { cutAt[cell] = k; cutDir[cell] = face; }
+  hist.push(cell);
+}
+function backStep() {        // back out of the last step: the cell is as it was before
+  const cell = hist.pop();
+  cutAt[cell] = prevCut.pop(); cutDir[cell] = prevDir.pop();
+  if (hist.length >= 2) face = dirOf(hist[hist.length - 2], hist[hist.length - 1]);
+}
+function arrived() {         // the whole lawn is cut when no cell has grown back
+  const k = hist.length - 1;
+  for (const i of LAWN) if (cutAt[i] < k - R + 1) return;
+  state = "won"; endTimer = 0; plan.length = 0; undo = 0;
+  saved.set(level % TOTAL + 1);
+  const next = level % TOTAL + 1;
+  setTimeout(() => { if (state === "won" && level % TOTAL + 1 === next) prepare(next); }, 120);
+}
+
+function update(dt) {
+  if (state !== "play") {
+    if (endBox.classList.contains("hidden") && (endTimer += dt) > 0.8) {
+      nextBtn.textContent = "next";
+      endBox.classList.remove("hidden");
+    }
+    return;
+  }
+  let left = dt;
+  for (let guard = 0; left > 1e-9 && guard < 1000; guard++) {
+    if (undo > 0) {
+      if (hist.length <= 1) { undo = 0; break; }
+      const rate = Math.max(6, undo * 2.5), need = m / rate;
+      if (left >= need) { left -= need; backStep(); undo--; m = 1; }
+      else { m -= left * rate; left = 0; }
+    } else if (m < 1) {
+      const need = (1 - m) / SPEED;
+      if (left >= need) { left -= need; m = 1; arrived(); if (state !== "play") break; }
+      else { m += left * SPEED; left = 0; }
+    } else if (plan.length) { step(); m = 0; }
+    else break;
+  }
+}
+
+// ---------- layout ----------
+let W, H, dpr, c, ox, oy;
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = W + "px"; cv.style.height = H + "px";
+  const top = 48, below = 136;
+  c = Math.max(12, Math.floor(Math.min((W - 20) / (COLS + 0.8), (H - top - below) / (ROWS + 0.8), 72)));
+  const edge = B * c / P, gw = COLS * c, gh = ROWS * c;
+  ox = Math.round((W - gw) / 2);
+  oy = Math.round(Math.max(top + edge, (H - gh - below) * 0.38 + edge * 0.5));
+  const rowY = oy + gh + edge + 10;
+  lvlLabel.style.top = rowY + "px"; lvlLabel.style.left = (ox - edge) + "px";
+  speedBtn.style.top = rowY + "px"; speedBtn.style.right = (W - (ox + gw + edge)) + "px";
+  hintBox.style.top = (rowY + 54) + "px";
+  endBox.style.top = (oy + gh / 2 - 24) + "px";
+}
+
+// ---------- the pixel picture ----------
+let bw, bh, base, pix, img, off, offCtx;
+function buildBase() {
+  bw = COLS * P + 2 * B; bh = ROWS * P + 2 * B;
+  off = document.createElement("canvas"); off.width = bw; off.height = bh; offCtx = off.getContext("2d");
+  img = offCtx.createImageData(bw, bh); pix = img.data; base = new Uint8ClampedArray(pix.length);
+  const keep = seed; seed = seedFor(level) ^ 0x5bd1e995;
+  const put = (x, y, col) => { if (x < 0 || y < 0 || x >= bw || y >= bh) return; const i = (y * bw + x) * 4; base[i] = col[0]; base[i + 1] = col[1]; base[i + 2] = col[2]; base[i + 3] = 255; };
+  // hedge all round, with a soft bumpy outer edge
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const ex = Math.min(x, bw - 1 - x), ey = Math.min(y, bh - 1 - y);
+    if (ex === 0 && ey === 0) continue;
+    if ((ex === 0 || ey === 0) && rnd() < 0.45) continue;
+    const r = rnd(); put(x, y, r < 0.18 ? HEDGE_L : r < 0.34 ? HEDGE_D : HEDGE);
+  }
+  const cx = i => B + (i % COLS) * P, cy = i => B + ((i / COLS) | 0) * P;
+  const same = (i, dx, dy) => { const x = i % COLS + dx, y = ((i / COLS) | 0) + dy; return x >= 0 && y >= 0 && x < COLS && y < ROWS && objId[y * COLS + x] === objId[i]; };
+  // the paving slab
+  { const X = cx(SLAB_CELL), Y = cy(SLAB_CELL);
+    for (let y = 0; y < P; y++) for (let x = 0; x < P; x++) {
+      const edge = x === 0 || y === 0 || x === P - 1 || y === P - 1 || x === 5 || y === 5;
+      put(X + x, Y + y, edge ? SLAB_D : rnd() < 0.1 ? SLAB_L : SLAB);
+    } }
+  for (const o of objects) {
+    if (o.type === "shed") {
+      const X = cx(o.cells[0]), Y = cy(o.cells[0]), S = 2 * P;
+      for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+        let col = (y % 4 === 3) ? ROOF_D : ROOF;
+        if (y === S / 2 - 1 || y === S / 2) col = ROOF_L;                        // ridge
+        if (x === 0 || x === S - 1 || y === 0 || y === S - 1) col = ROOF_E;     // eaves
+        put(X + x, Y + y, col);
+      }
+      continue;
+    }
+    for (const i of o.cells) {
+      const X = cx(i), Y = cy(i);
+      if (o.type === "tree") {
+        for (let y = 0; y < P; y++) for (let x = 0; x < P; x++) {   // grass under, shadow, round crown
+          put(X + x, Y + y, (Math.hypot(x - 5.5, y - 5.8) < 4.6) ? HEDGE_D : TALL_A);
+          const d = Math.hypot(x - 4.5, y - 4.5);
+          if (d < 4.3) put(X + x, Y + y, d > 3.4 ? TREE_D : (x + y < 7 && d > 1.2) ? TREE_L : TREE);
+        }
+        put(X + 6, Y + 3, APPLE); put(X + 3, Y + 6, APPLE); put(X + 6, Y + 6, APPLE);
+      } else if (o.type === "bed") {
+        for (let y = 0; y < P; y++) for (let x = 0; x < P; x++) {
+          const edge = (x === 0 && !same(i, -1, 0)) || (x === P - 1 && !same(i, 1, 0)) || (y === 0 && !same(i, 0, -1)) || (y === P - 1 && !same(i, 0, 1));
+          put(X + x, Y + y, edge ? SOIL_E : rnd() < 0.2 ? SOIL_D : SOIL);
+        }
+        for (let k = 0; k < 4; k++) {
+          const fx = X + 2 + ri(0, 5), fy = Y + 2 + ri(0, 5), fc = FLOWERS[ri(0, FLOWERS.length - 1)];
+          put(fx, fy + 1, LEAF); put(fx - 1, fy, fc); put(fx + 1, fy, fc); put(fx, fy - 1, fc); put(fx, fy, [250, 230, 140]);
+        }
+      } else if (o.type === "pond") {
+        for (let y = 0; y < P; y++) for (let x = 0; x < P; x++) {
+          const L = x === 0 && !same(i, -1, 0), Rt = x === P - 1 && !same(i, 1, 0), T = y === 0 && !same(i, 0, -1), Bm = y === P - 1 && !same(i, 0, 1);
+          if ((L || Rt) && (T || Bm)) { put(X + x, Y + y, TALL_A); continue; }   // rounded corners
+          put(X + x, Y + y, (L || Rt || T || Bm) ? RIM : WATER);
+        }
+        for (let k = 0; k < 2; k++) { const rx = X + ri(2, 5), ry = Y + ri(2, 7); for (let d = 0; d < 3; d++) put(rx + d, ry, WATER_L); }
+        if (rnd() < 0.5) { const lx = X + ri(2, 6), ly = Y + ri(2, 6); put(lx, ly, LILY); put(lx + 1, ly, LILY); put(lx, ly + 1, LILY); put(lx + 1, ly + 1, WATER_D); }
+      }
+    }
+  }
+  seed = keep;
+}
+
+function growth(age) {       // 0 = just cut, 1 = tall again
+  if (age >= R) return 1;
+  if (age <= R - 1) return 0.5 * Math.pow(Math.max(0, age) / Math.max(1, R - 1), 1.6);
+  return 0.5 + 0.5 * (age - (R - 1));       // the last step: it grows back
+}
+const mix = (a, b, f) => [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+
+function paint() {
+  pix.set(base);
+  const put = (x, y, col, a) => {
+    if (x < 0 || y < 0 || x >= bw || y >= bh) return;
+    const i = (y * bw + x) * 4;
+    if (a === undefined) { pix[i] = col[0]; pix[i + 1] = col[1]; pix[i + 2] = col[2]; pix[i + 3] = 255; }
+    else { pix[i] = pix[i] * (1 - a) + col[0] * a; pix[i + 1] = pix[i + 1] * (1 - a) + col[1] * a; pix[i + 2] = pix[i + 2] * (1 - a) + col[2] * a; pix[i + 3] = 255; }
+  };
+  const now = hist.length - 2 + m, entering = m < 0.5 && hist.length >= 2 ? hist[hist.length - 1] : -1;
+  LAWN.forEach((cell, k) => {
+    let at = cutAt[cell], d = cutDir[cell];
+    if (cell === entering) { at = prevCut[hist.length - 1]; d = prevDir[hist.length - 1]; }
+    const g = growth(now - at), X = B + (cell % COLS) * P, Y = B + ((cell / COLS) | 0) * P;
+    const tall = ((cell % COLS) + ((cell / COLS) | 0)) % 2 ? TALL_B : TALL_A;
+    if (g >= 1) {
+      for (let y = 0; y < P; y++) for (let x = 0; x < P; x++) put(X + x, Y + y, tall);
+      for (const [tx, ty, light] of tufts[k]) { const tc = light ? TUFT_L : TUFT_D; put(X + tx, Y + ty, tc); put(X + tx, Y + ty + 1, tc); }
+      return;
+    }
+    const light = d === 0 || d === 1, horiz = d === 0 || d === 2;
+    const s1 = mix(light ? CUT_L : CUT_D, tall, g), s2 = mix(light ? CUT_L2 : CUT_D2, tall, g);
+    for (let y = 0; y < P; y++) for (let x = 0; x < P; x++) put(X + x, Y + y, ((horiz ? y : x) % 3 === 1) ? s2 : s1);
+    if (g > 0.4) {
+      const f = Math.min(1, (g - 0.4) / 0.6);
+      for (const [tx, ty, lt] of tufts[k]) { put(X + tx, Y + ty + 1, lt ? TUFT_L : TUFT_D, f); if (f > 0.6) put(X + tx, Y + ty, lt ? TUFT_L : TUFT_D, f); }
+    }
+  });
+  // the mower, between its last two cells
+  const a = hist.length >= 2 ? hist[hist.length - 2] : hist[0], b = hist[hist.length - 1];
+  const fx = (a % COLS) + ((b % COLS) - (a % COLS)) * m, fy = ((a / COLS) | 0) + (((b / COLS) | 0) - ((a / COLS) | 0)) * m;
+  const MX = Math.round(B + fx * P), MY = Math.round(B + fy * P);
+  for (const pass of [0, 1]) for (let y = 0; y < 10; y++) for (let x = 0; x < 10; x++) {
+    let bx = x, by = y;
+    if (face === 2) bx = 9 - x; else if (face === 1) { bx = y; by = x; } else if (face === 3) { bx = 9 - y; by = x; }
+    const ch = MOWER[by][bx];
+    if (ch === ".") continue;
+    if (pass === 0) put(MX + x + 1, MY + y + 1, SHADOW, SHADOW[3]);
+    else put(MX + x, MY + y, MOWER_COL[ch]);
+  }
+  offCtx.putImageData(img, 0, 0);
+}
+
+function draw(time) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  paint();
+  const k = c / P;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, ox - B * k, oy - B * k, bw * k, bh * k);
+  if (state !== "play") return;
+  // the route ahead: a faint line from the mower to the end of the drawn path
+  const cen = i => [ox + (i % COLS + 0.5) * c, oy + (((i / COLS) | 0) + 0.5) * c];
+  const a = hist.length >= 2 ? hist[hist.length - 2] : hist[0], b = hist[hist.length - 1];
+  const pa = cen(a), pb = cen(b), pts = [[pa[0] + (pb[0] - pa[0]) * m, pa[1] + (pb[1] - pa[1]) * m]];
+  if (undo > 0) { for (let j = hist.length - 2; j >= hist.length - 1 - undo; j--) pts.push(cen(hist[j])); }
+  else if (m < 1) pts.push(pb);
+  for (const p of plan) pts.push(cen(p));
+  if (pts.length > 1) {
+    ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+    for (const p of pts) ctx.lineTo(p[0], p[1]);
+    ctx.strokeStyle = "rgba(255, 246, 214, 0.5)"; ctx.lineWidth = Math.max(2.5, c * 0.11);
+    ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.stroke();
+  }
+  // the end of the route: drag from here
+  const e = pts[pts.length - 1], pulse = reduceMotion ? 0.5 : 0.42 + 0.16 * Math.sin(time / 600);
+  ctx.beginPath(); ctx.arc(e[0], e[1], c * 0.47, 0, 7);
+  ctx.strokeStyle = `rgba(255, 246, 214, ${pulse})`; ctx.lineWidth = Math.max(2, c * 0.06); ctx.stroke();
+}
+
+// ---------- input: drag a path from its end; drag back to take it back; tap the path to cut it there ----------
+let dragging = false, pending = -1, moved = false, lastPt = null;
+function cellAt(x, y) {
+  const gx = Math.floor((x - ox) / c), gy = Math.floor((y - oy) / c);
+  return gx < 0 || gy < 0 || gx >= COLS || gy >= ROWS ? -1 : gy * COLS + gx;
+}
+function reach(cell) {       // follow the finger into this cell, filling in a corner when it cuts diagonally
+  if (cell < 0 || cell === routeEnd()) return;
+  if (pending >= 0) { truncate(pending); pending = -1; }
+  const e = routeEnd();
+  if (adjacent(cell, e)) { extend(cell); return; }
+  const ex = e % COLS, ey = (e / COLS) | 0, cx = cell % COLS, cy = (cell / COLS) | 0;
+  if (Math.abs(ex - cx) === 1 && Math.abs(ey - cy) === 1) {
+    const L = routeLen(), back = L >= 2 ? routeAt(L - 2) : -1;
+    const opts = [ey * COLS + cx, cy * COLS + ex].filter(drivable);
+    opts.sort((p, q) => (q === back) - (p === back));          // taking back a step comes first
+    for (const o of opts) if (extend(o)) { if (adjacent(cell, routeEnd())) extend(cell); return; }
+  }
+}
+cv.addEventListener("pointerdown", ev => {
+  if (state !== "play") return;
+  const cell = cellAt(ev.clientX, ev.clientY);
+  if (cell < 0) return;
+  const j = routeLast(cell);
+  if (j === routeLen() - 1) pending = -1;
+  else if (j >= 0) pending = j;
+  else if (adjacent(cell, routeEnd()) && drivable(cell)) { pending = -1; extend(cell); }
+  else return;
+  dragging = true; moved = false; lastPt = [ev.clientX, ev.clientY];
+  try { cv.setPointerCapture(ev.pointerId); } catch (e) {}
+});
+cv.addEventListener("pointermove", ev => {
+  if (!dragging || state !== "play") return;
+  const [x0, y0] = lastPt, x1 = ev.clientX, y1 = ev.clientY;
+  const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / (c * 0.25)));
+  for (let i = 1; i <= n; i++) {
+    const cell = cellAt(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n);
+    if (cell >= 0 && cell !== routeEnd() && (pending < 0 || cell !== routeAt(pending))) { moved = true; reach(cell); }
+  }
+  lastPt = [x1, y1];
+});
+function release() {
+  if (dragging && pending >= 0 && !moved) truncate(pending);
+  dragging = false; pending = -1; setHint();
+}
+cv.addEventListener("pointerup", release);
+cv.addEventListener("pointercancel", release);
+nextBtn.addEventListener("click", () => newLevel(level % TOTAL + 1));
+
+// ---------- loop ----------
+let last = 0;
+function frame(t) {
+  const dt = Math.min(0.05, (t - last) / 1000);
+  if (t - last >= 30) {                                     // about 30 frames a second is plenty
+    last = t;
+    for (let i = 0; i < SPEEDS[speedIdx]; i++) update(dt);   // faster = more steps per frame, same rules
+    draw(t);
+  }
+  requestAnimationFrame(frame);
+}
+speedBtn.addEventListener("click", () => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  speedBtn.textContent = SPEEDS[speedIdx] + "×";
+});
+addEventListener("resize", () => { layout(); });
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>

@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#25322c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Japanese garden</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #25322c; overflow: hidden;
+    touch-action: manipulation; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; }
+  button { font: 15px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em;
+    color: #e6eee6; background: #2f3e37; border: 1px solid #6f8a79; border-radius: 6px;
+    width: 104px; padding: 14px 0; cursor: pointer; }
+  button:active { background: #233029; }
+  button:focus-visible { outline: 2px solid #e6eee6; outline-offset: 3px; }
+  #home { position: fixed; top: env(safe-area-inset-top); left: 0; padding: 14px 12px 15px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #a3b5a8; text-decoration: none; }
+  #home:focus-visible { outline: 2px solid #e6eee6; outline-offset: -4px; }
+  #lvl { position: fixed; top: env(safe-area-inset-top); right: 0; padding: 14px 14px 15px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .08em; color: #a3b5a8; }
+  #end { position: fixed; display: flex; justify-content: center; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="lvl"></div>
+<div id="end" class="hidden"><button id="next">next</button></div>
+<script>
+"use strict";
+// ---------- settings ----------
+const TOTAL = 200;
+const RAKE_SECS = 6;          // the slow raking of the gravel when a garden is finished
+const S = 16;                 // gravel texture: S x S little squares per cell
+const RING = 0.75, GAP = 0.25; // raked rings around ornaments: reach and spacing, in cells
+const REDUCED = (() => { try { return matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; } })();
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+// ---------- colours ----------
+const BG = "#25322c", CARD = "#2d3b34", SLOT = "#2f3e37", SLOT_EDGE = "#4b5f53", TEXT = "#dfe8df", MUTED = "#a3b5a8";
+const MOSS = "#3a5240", GRAVEL = [217, 210, 193], SPECK_D = [205, 198, 180], SPECK_L = [226, 220, 206];
+const GROOVE = [189, 181, 160], RIDGE = [233, 228, 216];
+const WATER = "#4f9c94", WATER_D = "#367a73", WATER_L = "#86c5bb", LILY = "#6f9a52", LILY_D = "#55803f", LOTUS = "#f0c4c8";
+const STONE = "#8f9391", STONE_L = "#b4b8b5", STONE_D = "#686c6a", ROCK = "#7a7f7c", ROCK_D = "#585c5a";
+const PINE_D = "#244a32", PINE = "#33663f", PINE_L = "#4f8a52", TRUNK = "#6b4a32";
+const LAMP = "#a6a69d", LAMP_D = "#7c7d76", LIGHT = "#ffd27a";
+const PATH = "#a39b8a", PATH_L = "#b6af9e", PATH_D = "#8a8373";
+const WOOD = "#a26b3e", WOOD_D = "#7c4f2c", RAIL = "#b8553b";
+const SHADOW = "rgba(70,60,45,0.25)", CORAL = "#ec8a6b";
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const endBox = document.getElementById("end");
+const nextBtn = document.getElementById("next");
+const lvlLabel = document.getElementById("lvl");
+
+// ---------- seeded random ----------
+let seed = 0;
+function rnd() { // mulberry32
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+const pick = a => a[Math.floor(rnd() * a.length)];
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = ri(0, i); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+// ---------- numbered levels: level n always builds the same garden ----------
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+const saved = {                  // progress, kept in this browser only
+  get() { try { return parseInt(localStorage.getItem("garden.level"), 10) || 1; } catch (e) { return 1; } },
+  set(n) { try { localStorage.setItem("garden.level", String(n)); } catch (e) {} },
+};
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+
+// ---------- pieces ----------
+// water lies on the ground; the bridge may stand over water; everything else needs bare gravel
+const KIND = {
+  rock:    { w: 1, h: 1, stone: true },        // a fixed rock, part of the garden from the start
+  stone:   { w: 1, h: 1, stone: true },
+  slab:    { w: 2, h: 1, stone: true, turns: true },
+  lantern: { w: 1, h: 1 },
+  pine:    { w: 2, h: 2 },
+  path:    { w: 1, h: 1 },
+  water:   { w: 1, h: 1 },
+  bridge:  { w: 3, h: 1, turns: true },
+};
+const TRAY_ORDER = ["pine", "bridge", "water", "path", "lantern", "slab", "stone"];
+let N = 5, pcs = [], ground, upper, solution = [];
+const dims = (t, rot) => rot ? [KIND[t].h, KIND[t].w] : [KIND[t].w, KIND[t].h];
+function cellsOf(t, x, y, rot) {           // cells covered, row by row (the bridge's middle is always [1])
+  const [w, h] = dims(t, rot);
+  if (x < 0 || y < 0 || x + w > N || y + h > N) return null;
+  const out = [];
+  for (let dy = 0; dy < h; dy++) for (let dx = 0; dx < w; dx++) out.push((y + dy) * N + x + dx);
+  return out;
+}
+function clearBoard() { ground = new Int16Array(N * N).fill(-1); upper = new Int16Array(N * N).fill(-1); }
+function fits(i, x, y, rot) {
+  const p = pcs[i], cs = cellsOf(p.t, x, y, rot);
+  if (!cs) return false;
+  for (const c of cs) {
+    const g = ground[c], tp = upper[c], gFree = g < 0 || g === i, tFree = tp < 0 || tp === i;
+    if (p.t === "water") { if (!gFree || (!tFree && pcs[tp].t !== "bridge")) return false; }
+    else if (p.t === "bridge") { if (!tFree) return false; }
+    else if (!tFree || !gFree) return false;
+  }
+  return true;
+}
+function put(i, x, y, rot) {
+  const p = pcs[i]; p.x = x; p.y = y; p.rot = rot; p.on = true;
+  for (const c of cellsOf(p.t, x, y, rot)) (p.t === "water" ? ground : upper)[c] = i;
+}
+function lift(i) {
+  const p = pcs[i]; if (!p.on) return;
+  const layer = p.t === "water" ? ground : upper;
+  for (const c of cellsOf(p.t, p.x, p.y, p.rot)) if (layer[c] === i) layer[c] = -1;
+  p.on = false;
+}
+function loadGarden(g) {
+  N = g.N;
+  pcs = g.sol.map((s, i) => ({ t: s.t, x: s.x, y: s.y, rot: s.fixed ? s.rot : 0, fixed: !!s.fixed, on: false,
+    v: ((i + 1) * 2654435761 >>> 0) % 1000 / 1000 }));
+  clearBoard();
+  pcs.forEach((p, i) => { if (p.fixed) put(i, p.x, p.y, p.rot); });
+}
+
+// ---------- harmony rules ----------
+// stones never touch (not even at corners); every lantern beside the path;
+// all water in one pond; the bridge crosses water and ends on dry land
+function evaluate() {
+  const bad = new Uint8Array(pcs.length), broken = { stones: false, lantern: false, pond: false };
+  const isStone = j => j >= 0 && KIND[pcs[j].t].stone;
+  let all = true;
+  pcs.forEach((p, i) => {
+    if (!p.on) { all = false; return; }
+    const cs = cellsOf(p.t, p.x, p.y, p.rot);
+    if (KIND[p.t].stone) for (const c of cs) {
+      const x = c % N, y = c / N | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= N || ny >= N) continue;
+        const j = upper[ny * N + nx];
+        if (j !== i && isStone(j)) { bad[i] = bad[j] = 1; broken.stones = true; }
+      }
+    }
+    if (p.t === "lantern") {
+      const c = cs[0], x = c % N, y = c / N | 0;
+      const ok = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dy]) => {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= N || ny >= N) return false;
+        const j = upper[ny * N + nx]; return j >= 0 && pcs[j].t === "path";
+      });
+      if (!ok) { bad[i] = 1; broken.lantern = true; }
+    }
+    if (p.t === "bridge" && !(ground[cs[1]] >= 0 && ground[cs[0]] < 0 && ground[cs[2]] < 0)) { bad[i] = 1; broken.pond = true; }
+  });
+  // the pond: the patch of water holding a fixed water cell, otherwise the largest patch
+  const comp = new Int16Array(N * N).fill(-1), comps = [];
+  for (let c0 = 0; c0 < N * N; c0++) {
+    if (ground[c0] < 0 || comp[c0] >= 0) continue;
+    const k = comps.length, list = [c0]; comp[c0] = k;
+    let fixed = false;
+    for (let h = 0; h < list.length; h++) {
+      const c = list[h], x = c % N, y = c / N | 0;
+      if (pcs[ground[c]].fixed) fixed = true;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= N || ny >= N) continue;
+        const n = ny * N + nx;
+        if (ground[n] >= 0 && comp[n] < 0) { comp[n] = k; list.push(n); }
+      }
+    }
+    comps.push({ list, fixed });
+  }
+  if (comps.length > 1) {
+    let main = 0;
+    comps.forEach((q, k) => {
+      const m = comps[main];
+      if ((q.fixed && !m.fixed) || (q.fixed === m.fixed && q.list.length > m.list.length)) main = k;
+    });
+    comps.forEach((q, k) => { if (k !== main) for (const c of q.list) bad[ground[c]] = 1; });
+    broken.pond = true;
+  }
+  const clean = !bad.some(b => b);
+  return { bad, broken, done: all && clean };
+}
+
+// ---------- making a garden: build a finished one first, then hand over its pieces ----------
+function params(n) {
+  const hard = n >= 5 && n % 5 === 0;               // every fifth garden is a little larger or fuller
+  let size = n <= 4 ? 5 : n <= 20 ? 6 : n <= 60 ? 7 : 8;
+  if (hard && n <= 60) size = Math.min(8, size + 1);
+  const s = size - 5;
+  const P = { N: size, hard };
+  P.lantern = n >= 2;
+  P.slab = n >= 3;
+  P.water = n >= 4 && (hard || n < 8 || rnd() < 0.85);
+  P.bridge = P.water && n >= 6 && (hard || n < 12 || rnd() < 0.8);
+  P.pines = [1, rnd() < 0.4 ? 2 : 1, 2, rnd() < 0.5 ? 3 : 2][s];
+  P.path = P.lantern ? ri([3, 4, 5, 6][s], [4, 6, 8, 10][s]) : 0;
+  P.lanterns = P.lantern ? ri([1, 1, 2, 2][s], [1, 2, 2, 3][s]) : 0;
+  P.pond = P.water ? ri([3, 4, 5, 6][s], [3, 5, 7, 9][s]) : 0;
+  P.rocks = 1 + (n >= 12 && rnd() < 0.5 ? 1 : 0) + (n > 60 && rnd() < 0.5 ? 1 : 0) + (hard && n > 30 ? 1 : 0);
+  P.waterAnchors = P.water ? (n >= 30 && rnd() < 0.5 ? 2 : 1) : 0;
+  P.keep = hard ? 1 : Math.min(1, 0.5 + n / 70);    // share of the stones that fit which the tray holds
+  P.slabs = P.slab ? ri(1, 1 + s) : 0;
+  P.packs = n < 10 ? 1 : hard ? 24 : Math.min(16, 2 + (n >> 3));   // more tries: a tighter fit of stones
+  return P;
+}
+
+function tryGarden(P) {
+  const n = P.N, NN = n * n;
+  const occ = new Array(NN).fill(""), sol = [];
+  const at = (x, y) => (x < 0 || y < 0 || x >= n || y >= n) ? -1 : y * n + x;
+  const X = c => c % n, Y = c => c / n | 0;
+  const n4 = c => [at(X(c) + 1, Y(c)), at(X(c) - 1, Y(c)), at(X(c), Y(c) + 1), at(X(c), Y(c) - 1)].filter(v => v >= 0);
+  const n8 = c => { const o = []; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const v = at(X(c) + dx, Y(c) + dy); if (v >= 0 && v !== c) o.push(v); } return o; };
+  const free = c => c >= 0 && !occ[c];
+  let ends = [];
+  // pond, and the bridge across its narrowest place
+  if (P.water) {
+    const water = new Set(), blocked = new Set();
+    let mid = -1;
+    if (P.bridge) {
+      const o = ri(0, 1), mx = ri(1, n - 2), my = ri(1, n - 2);
+      mid = at(mx, my);
+      const e = o === 0 ? [[mx - 1, my, -1, 0], [mx + 1, my, 1, 0]] : [[mx, my - 1, 0, -1], [mx, my + 1, 0, 1]];
+      water.add(mid);
+      for (const c of (o === 0 ? [at(mx, my - 1), at(mx, my + 1)] : [at(mx - 1, my), at(mx + 1, my)])) water.add(c);
+      for (const [x, y, dx, dy] of e) { blocked.add(at(x, y)); occ[at(x, y)] = "bridge"; ends.push({ c: at(x, y), out: at(x + dx, y + dy) }); }
+      sol.push({ t: "bridge", x: o === 0 ? mx - 1 : mx, y: o === 0 ? my : my - 1, rot: o });
+    } else water.add(ri(0, NN - 1));
+    while (water.size < P.pond) {
+      const cand = [];
+      for (const w of water) for (const nb of n4(w)) if (!water.has(nb) && !blocked.has(nb)) {
+        const k = n4(nb).filter(v => water.has(v)).length; for (let j = 0; j < k * k; j++) cand.push(nb);
+      }
+      if (!cand.length) return null;
+      water.add(pick(cand));
+    }
+    const wl = [...water], anchors = new Set();
+    const a0 = pick(wl.filter(c => c !== mid)); anchors.add(a0);
+    if (P.waterAnchors > 1) { const nb = n4(a0).filter(c => water.has(c) && c !== mid); if (nb.length) anchors.add(pick(nb)); }
+    for (const c of wl) { occ[c] = "water"; sol.push({ t: "water", x: X(c), y: Y(c), rot: 0, fixed: anchors.has(c) }); }
+  }
+  // stepping-stone path: from the bridge ends when there is a bridge, otherwise in from an edge
+  if (P.path) {
+    let len = 0;
+    const isPath = new Uint8Array(NN);
+    const block = c => {                          // keep the path one stone wide
+      for (const [dx, dy] of [[0, 0], [-1, 0], [0, -1], [-1, -1]]) {
+        const x0 = X(c) + dx, y0 = Y(c) + dy; let k = 0;
+        for (const [ex, ey] of [[0, 0], [1, 0], [0, 1], [1, 1]]) { const v = at(x0 + ex, y0 + ey); if (v >= 0 && v !== c && isPath[v]) k++; }
+        if (k === 3) return true;
+      }
+      return false;
+    };
+    const walk = (start, want) => {
+      if (!free(start) || want <= 0) return;
+      let cur = start, dir = -1, k = 0;
+      for (;;) {
+        occ[cur] = "path"; isPath[cur] = 1; sol.push({ t: "path", x: X(cur), y: Y(cur), rot: 0 }); len++; k++;
+        if (k >= want) return;
+        const opts = [];
+        [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(([dx, dy], d) => { const v = at(X(cur) + dx, Y(cur) + dy); if (free(v) && !block(v)) opts.push([v, d]); });
+        if (!opts.length) return;
+        const straight = opts.find(o => o[1] === dir);
+        const nx = straight && rnd() < 0.5 ? straight : pick(opts);
+        cur = nx[0]; dir = nx[1];
+      }
+    };
+    const startNear = e => free(e.out) ? e.out : (n4(e.c).filter(free)[0] ?? -1);
+    if (ends.length) { walk(startNear(ends[0]), Math.ceil(P.path / 2)); walk(startNear(ends[1]), P.path - len); }
+    else {
+      const edge = []; for (let c = 0; c < NN; c++) if (free(c) && (X(c) === 0 || Y(c) === 0 || X(c) === n - 1 || Y(c) === n - 1)) edge.push(c);
+      if (edge.length) walk(pick(edge), P.path);
+    }
+    if (len < P.path - 1) return null;
+  }
+  // fixed rocks
+  const stoneAt = new Uint8Array(NN);
+  const roomy = c => free(c) && n8(c).every(v => !stoneAt[v]);
+  for (let k = 0; k < P.rocks; k++) {
+    const cand = []; for (let c = 0; c < NN; c++) if (roomy(c)) cand.push(c);
+    if (!cand.length) return null;
+    const c = pick(cand); occ[c] = "rock"; stoneAt[c] = 1; sol.push({ t: "rock", x: X(c), y: Y(c), rot: 0, fixed: true });
+  }
+  // pines
+  for (let k = 0; k < P.pines; k++) {
+    const cand = [];
+    for (let y = 0; y < n - 1; y++) for (let x = 0; x < n - 1; x++)
+      if (free(at(x, y)) && free(at(x + 1, y)) && free(at(x, y + 1)) && free(at(x + 1, y + 1))) cand.push([x, y]);
+    if (!cand.length) return null;
+    const [x, y] = pick(cand);
+    for (const c of [at(x, y), at(x + 1, y), at(x, y + 1), at(x + 1, y + 1)]) occ[c] = "pine";
+    sol.push({ t: "pine", x, y, rot: 0 });
+  }
+  // lanterns beside the path
+  for (let k = 0; k < P.lanterns; k++) {
+    const cand = []; for (let c = 0; c < NN; c++) if (free(c) && n4(c).some(v => occ[v] === "path")) cand.push(c);
+    if (!cand.length) return null;
+    const c = pick(cand); occ[c] = "lantern"; sol.push({ t: "lantern", x: X(c), y: Y(c), rot: 0 });
+  }
+  // stones: the fullest of several packings, kept apart from each other; the tray holds a share of them
+  const pack = () => {
+    const sAt = stoneAt.slice(), o = occ.slice(), out = []; let slabs = 0;
+    const room = c => c >= 0 && !o[c] && n8(c).every(v => !sAt[v]);
+    for (const c of shuffle([...Array(NN).keys()])) {
+      if (!room(c)) continue;
+      let done = false;
+      if (slabs < P.slabs && rnd() < 0.6)
+        for (const [dx, dy] of shuffle([[1, 0], [0, 1]])) {
+          const c2 = at(X(c) + dx, Y(c) + dy);
+          if (c2 < 0 || !room(c2)) continue;
+          sAt[c] = sAt[c2] = 1; o[c] = o[c2] = "slab"; slabs++; done = true;
+          out.push({ t: "slab", x: X(c), y: Y(c), rot: dy ? 1 : 0 }); break;
+        }
+      if (!done) { sAt[c] = 1; o[c] = "stone"; out.push({ t: "stone", x: X(c), y: Y(c), rot: 0 }); }
+    }
+    return out;
+  };
+  let stones = [];
+  for (let k = 0; k < P.packs; k++) { const st = pack(); if (st.length > stones.length) stones = st; }
+  if (stones.length < 2) return null;
+  shuffle(stones);
+  const keepN = Math.max(2, Math.round(stones.length * P.keep));
+  for (const s of stones.slice(0, keepN)) sol.push(s);
+  return { N: n, sol };
+}
+
+// a careless gardener: drops every piece anywhere it fits; a garden this solves is too easy
+function careless(g, tries) {
+  const n = g.N, NN = n * n, at = (x, y) => (x < 0 || y < 0 || x >= n || y >= n) ? -1 : y * n + x;
+  const fixed = g.sol.filter(s => s.fixed), loose = g.sol.filter(s => !s.fixed).map(s => s.t);
+  for (let t = 0; t < tries; t++) {
+    const wet = new Uint8Array(NN), who = new Int16Array(NN).fill(-1), kind = new Array(NN).fill("");
+    let anchor = -1, id = 0, ok = true;
+    const set = (c, tp) => { if (tp === "water") wet[c] = 1; else { who[c] = id; kind[c] = tp; } };
+    for (const s of fixed) { const c = s.y * n + s.x; set(c, s.t); if (s.t === "water") anchor = c; id++; }
+    const bridges = [];
+    for (const tp of shuffle(loose.slice())) {
+      const opts = [];
+      for (let rot = 0; rot < (KIND[tp].turns ? 2 : 1); rot++) {
+        const [w, h] = dims(tp, rot);
+        for (let y = 0; y + h <= n; y++) for (let x = 0; x + w <= n; x++) {
+          const q = []; let fit = true;
+          for (let dy = 0; dy < h && fit; dy++) for (let dx = 0; dx < w; dx++) {
+            const c = at(x + dx, y + dy); q.push(c);
+            if (tp === "water" ? (wet[c] || (who[c] >= 0 && kind[c] !== "bridge")) : tp === "bridge" ? who[c] >= 0 : (who[c] >= 0 || wet[c])) { fit = false; break; }
+          }
+          if (fit) opts.push(q);
+        }
+      }
+      if (!opts.length) { ok = false; break; }
+      const q = pick(opts);
+      for (const c of q) set(c, tp);
+      if (tp === "bridge") bridges.push(q);
+      id++;
+    }
+    if (!ok) continue;
+    // every rule must hold
+    for (let c = 0; c < NN && ok; c++) {
+      const x = c % n, y = c / n | 0, k = kind[c];
+      if (KIND[k] && KIND[k].stone) {
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const v = at(x + dx, y + dy); if (v >= 0 && who[v] !== who[c] && KIND[kind[v]] && KIND[kind[v]].stone) ok = false; }
+      } else if (k === "lantern") {
+        if (![[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dy]) => { const v = at(x + dx, y + dy); return v >= 0 && kind[v] === "path"; })) ok = false;
+      }
+    }
+    for (const q of bridges) if (!wet[q[1]] || wet[q[0]] || wet[q[2]]) ok = false;
+    if (ok && anchor >= 0) {
+      const seen = new Uint8Array(NN), st = [anchor]; seen[anchor] = 1; let cnt = 0, all = 0;
+      while (st.length) { const c = st.pop(); cnt++; for (const v of [at(c % n + 1, c / n | 0), at(c % n - 1, c / n | 0), at(c % n, (c / n | 0) + 1), at(c % n, (c / n | 0) - 1)]) if (v >= 0 && wet[v] && !seen[v]) { seen[v] = 1; st.push(v); } }
+      for (let c = 0; c < NN; c++) all += wet[c];
+      if (cnt !== all) ok = false;
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+// a hasty gardener: follows every rule, but sets each piece in a random spot where it breaks nothing yet;
+// how often this works tells how much thought a garden asks for
+function hasty(g, tries) {
+  const n = g.N, NN = n * n, at = (x, y) => (x < 0 || y < 0 || x >= n || y >= n) ? -1 : y * n + x;
+  const order = ["water", "bridge", "pine", "path", "lantern", "slab", "stone"];
+  const loose = g.sol.filter(s => !s.fixed).map(s => s.t).sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  let wins = 0;
+  for (let t = 0; t < tries; t++) {
+    const wet = new Uint8Array(NN), used = new Uint8Array(NN), stone = new Uint8Array(NN), path = new Uint8Array(NN);
+    for (const s of g.sol) if (s.fixed) { const c = s.y * n + s.x; if (s.t === "water") wet[c] = 1; else { used[c] = 1; stone[c] = 1; } }
+    const dry = c => c >= 0 && !used[c] && !wet[c];
+    const near = (c, arr, k8) => { const x = c % n, y = c / n | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { if (!dx && !dy) continue; if (!k8 && dx && dy) continue; const v = at(x + dx, y + dy); if (v >= 0 && arr[v]) return true; }
+      return false; };
+    let ok = true;
+    for (const tp of loose) {
+      const opts = [];
+      for (let c = 0; c < NN; c++) {
+        const x = c % n, y = c / n | 0;
+        if (tp === "water") { if (dry(c) && (near(c, wet, false) || !wet.some(v => v))) opts.push([c]); }
+        else if (tp === "bridge") for (const [dx, dy] of [[1, 0], [0, 1]]) {
+          const a = at(x - dx, y - dy), b = at(x + dx, y + dy);
+          if (wet[c] && !used[c] && dry(a) && dry(b)) opts.push([a, c, b]);
+        }
+        else if (tp === "pine") { const q = [c, at(x + 1, y), at(x, y + 1), at(x + 1, y + 1)]; if (q.every(dry)) opts.push(q); }
+        else if (tp === "path") { if (dry(c)) opts.push([c]); }
+        else if (tp === "lantern") { if (dry(c) && near(c, path, false)) opts.push([c]); }
+        else if (tp === "stone") { if (dry(c) && !near(c, stone, true)) opts.push([c]); }
+        else for (const [dx, dy] of [[1, 0], [0, 1]]) {
+          const b = at(x + dx, y + dy);
+          if (dry(c) && dry(b) && !near(c, stone, true) && !near(b, stone, true)) opts.push([c, b]);
+        }
+      }
+      if (!opts.length) { ok = false; break; }
+      const q = pick(opts);
+      for (const c of q) {
+        if (tp === "water") wet[c] = 1; else used[c] = 1;
+        if (tp === "stone" || tp === "slab") stone[c] = 1;
+        if (tp === "path") path[c] = 1;
+      }
+    }
+    if (ok) wins++;
+  }
+  return wins / tries;
+}
+
+// how often the hasty gardener may succeed: less often as levels go on, and less on every fifth level
+function aim(n) { return 0.85 - 0.6 * Math.min(1, Math.max(0, n - 5) / 150) - (n >= 5 && n % 5 === 0 ? 0.15 : 0); }
+
+function makeGarden(n) {
+  seed = seedFor(n);
+  const P = params(n), target = aim(n), CANDIDATES = n < 5 ? 1 : n < 20 ? 4 : 8;
+  let best = null, bestGap = 9, last = null, found = 0;
+  for (let a = 0; a < 400 && found < CANDIDATES; a++) {
+    const g = tryGarden(P);
+    if (!g) continue;
+    last = g;
+    if (n >= 3 && careless(g, 16)) continue;
+    found++;
+    if (CANDIDATES === 1) return g;
+    const gap = Math.abs(hasty(g, 30) - target);
+    if (gap < bestGap) { best = g; bestGap = gap; }
+  }
+  return best || last;
+}
+
+// ---------- level state ----------
+let state = "play", ev = null, rakeT = 0, endTimer = 0, dirty = true, drag = null, rules = [], trayTypes = [];
+let levelSeed = 0;
+
+function newLevel(n) {
+  level = n;
+  lvlLabel.textContent = n + " / " + TOTAL;
+  levelSeed = seedFor(n);
+  const g = makeGarden(n);
+  loadGarden(g);
+  solution = g.sol.map(s => ({ ...s }));
+  trayTypes = TRAY_ORDER.filter(t => pcs.some(p => p.t === t && !p.fixed));
+  rules = [{ k: "place" }, { k: "stones" }];
+  if (pcs.some(p => p.t === "lantern")) rules.push({ k: "lantern" });
+  if (pcs.some(p => p.t === "water")) rules.push({ k: "pond", bridge: pcs.some(p => p.t === "bridge") });
+  state = "play"; rakeT = 0; endTimer = 0; drag = null;
+  endBox.classList.add("hidden");
+  buildGravel();
+  layout();
+  ev = evaluate();
+  dirty = true;
+}
+
+function changed() {
+  ev = evaluate();
+  dirty = true;
+  if (state === "play" && ev.done) {
+    state = "raking"; rakeT = REDUCED ? 1 : 0; endTimer = 0;
+    saved.set(level % TOTAL + 1);
+    computeRake();
+  }
+}
+
+// ---------- gravel and the raked lines ----------
+const gcv = document.createElement("canvas"), gctx = gcv.getContext("2d");
+let gimg, gbase, rakeKind, rakeAt;
+function buildGravel() {
+  const R = N * S; gcv.width = gcv.height = R;
+  gimg = gctx.createImageData(R, R); gbase = new Uint8ClampedArray(R * R * 3);
+  rakeKind = new Uint8Array(R * R); rakeAt = new Float32Array(R * R);
+  let h = levelSeed | 1;
+  for (let k = 0; k < R * R; k++) {
+    h ^= h << 13; h ^= h >>> 17; h ^= h << 5;
+    const v = (h >>> 0) / 4294967296, col = v < 0.08 ? SPECK_D : v < 0.13 ? SPECK_L : GRAVEL;
+    gbase[k * 3] = col[0]; gbase[k * 3 + 1] = col[1]; gbase[k * 3 + 2] = col[2];
+  }
+  paintGravel(0);
+}
+function paintGravel(t) {
+  const R = N * S, d = gimg.data;
+  for (let k = 0; k < R * R; k++) {
+    let r = gbase[k * 3], g = gbase[k * 3 + 1], b = gbase[k * 3 + 2];
+    if (rakeKind[k] && t > rakeAt[k]) {
+      const a = Math.min(1, (t - rakeAt[k]) / 0.06), col = rakeKind[k] === 1 ? GROOVE : RIDGE;
+      r += (col[0] - r) * a; g += (col[1] - g) * a; b += (col[2] - b) * a;
+    }
+    d[k * 4] = r; d[k * 4 + 1] = g; d[k * 4 + 2] = b; d[k * 4 + 3] = 255;
+  }
+  gctx.putImageData(gimg, 0, 0);
+}
+// rings follow the outline of every ornament; straight lines fill the open gravel, raked from left to right
+function computeRake() {
+  const shapes = [], R = N * S;               // rounded boxes: centre, half sizes, corner radius (in cells)
+  pcs.forEach(p => {
+    if (!p.on) return;
+    const [w, h] = dims(p.t, p.rot), cx = p.x + w / 2, cy = p.y + h / 2;
+    const add = (hx, hy, r) => shapes.push([cx, cy, hx, hy, r]);
+    switch (p.t) {
+      case "stone": add(0.34, 0.34, 0.34); break;
+      case "rock": add(0.42, 0.42, 0.42); break;
+      case "lantern": add(0.3, 0.3, 0.3); break;
+      case "slab": p.rot ? add(0.32, 0.85, 0.32) : add(0.85, 0.32, 0.32); break;
+      case "pine": add(0.9, 0.9, 0.9); break;
+      case "path": add(0.38, 0.38, 0.22); break;
+      case "bridge": p.rot ? add(0.4, 1.5, 0.05) : add(1.5, 0.4, 0.05); break;
+      default: add(0.5, 0.5, 0);
+    }
+  });
+  for (let sy = 0; sy < R; sy++) for (let sx = 0; sx < R; sx++) {
+    const px = (sx + 0.5) / S, py = (sy + 0.5) / S, k = sy * R + sx;
+    let d = 1e9;
+    for (const [cx, cy, hx, hy, r] of shapes) {
+      const qx = Math.abs(px - cx) - hx + r, qy = Math.abs(py - cy) - hy + r;
+      d = Math.min(d, Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r);
+    }
+    rakeKind[k] = 0;
+    if (d <= 0.02) continue;
+    let f;
+    if (d <= RING) { f = d / GAP; rakeAt[k] = 0.03 + 0.3 * d / RING; }
+    else { f = (py + 0.06 * Math.sin(px * 1.3)) / GAP; rakeAt[k] = 0.38 + 0.55 * px / N + 0.02 * Math.sin(py * 3); }
+    const ph = f - Math.floor(f);
+    rakeKind[k] = ph < 0.25 ? 1 : ph < 0.5 ? 2 : 0;
+  }
+}
+
+// ---------- layout ----------
+let W, H, dpr, c, gx, gy, ruleBoxes = [], slots = [], trayBox = null;
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = W + "px"; cv.style.height = H + "px";
+  const land = W > H * 1.1 && W >= 640;
+  const nr = rules.length, nt = trayTypes.length, gapR = 8, ruleH = land ? 62 : 54, icon = land ? 42 : 36, font = land ? 15 : 13.5;
+  ruleBoxes = []; slots = [];
+  let panelX, panelW, ry, trayY, slotW, slotH = 80, cols = 4;
+  if (!land) {
+    panelW = Math.min(W - 24, 480); panelX = (W - panelW) / 2;
+    ry = 46;
+    const rows = Math.ceil(nr / 2), rulesH = rows * ruleH + (rows - 1) * gapR;
+    const trayRows = Math.ceil(nt / cols), trayH = trayRows * slotH + (trayRows - 1) * 8;
+    const avail = H - (ry + rulesH + 16) - (trayH + 20) - 14;
+    c = Math.max(20, Math.floor(Math.min(W - 24, avail, 600) / N));
+    const spare = avail - N * c;                 // a tall phone: centre the column a little
+    if (spare > 30) ry += Math.min(spare * 0.4, 80);
+    gx = Math.round((W - N * c) / 2); gy = Math.round(ry + rulesH + 16);
+    const cw = (panelW - gapR) / 2;
+    rules.forEach((r, i) => ruleBoxes.push({ ...r, icon, font, x: panelX + (i % 2) * (cw + gapR), y: ry + (i >> 1) * (ruleH + gapR), w: cw, h: ruleH }));
+    trayY = gy + N * c + 20;
+  } else {
+    c = Math.max(20, Math.floor(Math.min(H - 96, W * 0.55, 640) / N));
+    panelW = Math.min(380, W - N * c - 96);
+    gx = Math.round((W - (N * c + 48 + panelW)) / 2); gy = Math.round((H - N * c) / 2 + 10);
+    panelX = gx + N * c + 48;
+    const total = nr * ruleH + (nr - 1) * gapR + 24 + Math.ceil(nt / cols) * (slotH + 8);
+    ry = Math.max(46, gy + (N * c - total) / 2);
+    rules.forEach((r, i) => ruleBoxes.push({ ...r, icon, font, x: panelX, y: ry + i * (ruleH + gapR), w: panelW, h: ruleH }));
+    trayY = ry + nr * ruleH + (nr - 1) * gapR + 24;
+  }
+  slotW = (panelW - (cols - 1) * 8) / cols;
+  const rows = Math.ceil(nt / cols);
+  trayTypes.forEach((t, i) => {
+    const row = i / cols | 0, inRow = Math.min(cols, nt - row * cols);
+    const x0 = panelX + (panelW - (inRow * slotW + (inRow - 1) * 8)) / 2;
+    slots.push({ t, x: x0 + (i % cols) * (slotW + 8), y: trayY + row * (slotH + 8), w: slotW, h: slotH });
+  });
+  trayBox = { x: panelX - 6, y: trayY - 6, w: panelW + 12, h: rows * (slotH + 8) + 4 };
+  endBox.style.left = panelX + "px"; endBox.style.width = panelW + "px";
+  endBox.style.top = (trayY + Math.min(rows * (slotH + 8), 120) / 2 - 22) + "px";
+  dirty = true;
+}
+
+// ---------- drawing ----------
+function rrect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
+function ell(x, y, rx, ry, col) { ctx.beginPath(); ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), 0, 0, 7); ctx.fillStyle = col; ctx.fill(); }
+
+function drawWater(X, Y, u, edges, v, lily) {
+  ctx.fillStyle = WATER; ctx.fillRect(X, Y, u + 0.5, u + 0.5);
+  ctx.fillStyle = WATER_L;
+  const t = Math.max(1.5, u * 0.045);
+  ctx.fillRect(X + u * (0.14 + 0.3 * v), Y + u * 0.32, u * 0.24, t);
+  ctx.fillRect(X + u * (0.52 - 0.3 * v), Y + u * 0.68, u * 0.2, t);
+  ctx.fillStyle = WATER_D;
+  const e = Math.max(2, u * 0.08);
+  if (edges[0]) ctx.fillRect(X, Y, u, e);
+  if (edges[1]) ctx.fillRect(X, Y + u - e, u, e);
+  if (edges[2]) ctx.fillRect(X, Y, e, u);
+  if (edges[3]) ctx.fillRect(X + u - e, Y, e, u);
+  if (lily) {                                  // the fixed part of the pond carries a lily pad
+    const lx = X + u * 0.62, ly = Y + u * 0.44, r = u * 0.2;
+    ctx.beginPath(); ctx.moveTo(lx, ly); ctx.arc(lx, ly, r, 0.5, Math.PI * 2 - 0.1); ctx.closePath(); ctx.fillStyle = LILY; ctx.fill();
+    ell(lx - r * 0.25, ly - r * 0.25, r * 0.35, r * 0.25, "#86b166");
+    ell(X + u * 0.3, Y + u * 0.62, u * 0.08, u * 0.08, LOTUS);
+  }
+}
+
+function drawStone(cx, cy, rx, ry, base, light, dark) {
+  ell(cx + rx * 0.08, cy + ry * 0.55, rx * 1.05, ry * 0.7, SHADOW);
+  ell(cx, cy + ry * 0.14, rx, ry, dark);
+  ell(cx, cy, rx * 0.96, ry * 0.88, base);
+  ell(cx - rx * 0.28, cy - ry * 0.32, rx * 0.45, ry * 0.32, light);
+}
+
+// a piece drawn with its footprint's top-left corner at X, Y and cells of u pixels
+function drawPiece(t, X, Y, u, rot, v) {
+  const [w, h] = dims(t, rot);
+  const cx = X + w * u / 2, cy = Y + h * u / 2;
+  switch (t) {
+    case "stone": drawStone(cx, cy, u * (0.3 + 0.05 * v), u * (0.25 + 0.04 * (1 - v)), STONE, STONE_L, STONE_D); break;
+    case "rock": {
+      drawStone(cx, cy, u * 0.42, u * 0.34, ROCK, STONE, ROCK_D);
+      ell(cx + u * 0.1, cy - u * 0.12, u * 0.18, u * 0.08, "#6d8a4f");
+      break;
+    }
+    case "slab": drawStone(cx, cy, (rot ? 0.3 : 0.82) * u, (rot ? 0.78 : 0.28) * u, STONE, STONE_L, STONE_D); break;
+    case "path": {
+      const j = (v - 0.5) * u * 0.06;
+      rrect(X + u * 0.13 + j, Y + u * 0.17, u * 0.74, u * 0.72, u * 0.24); ctx.fillStyle = PATH_D; ctx.fill();
+      rrect(X + u * 0.13 + j, Y + u * 0.13, u * 0.74, u * 0.7, u * 0.24); ctx.fillStyle = PATH; ctx.fill();
+      ell(X + u * 0.4 + j, Y + u * 0.33, u * 0.18, u * 0.08, PATH_L);
+      break;
+    }
+    case "water": drawWater(X, Y, u, [1, 1, 1, 1], v, false); break;
+    case "lantern": {
+      ell(cx + u * 0.04, Y + u * 0.88, u * 0.3, u * 0.08, SHADOW);
+      ctx.fillStyle = LAMP_D; ctx.fillRect(cx - u * 0.24, Y + u * 0.76, u * 0.48, u * 0.11);
+      ctx.fillStyle = LAMP; ctx.fillRect(cx - u * 0.08, Y + u * 0.5, u * 0.16, u * 0.28);
+      ctx.fillStyle = LAMP_D; ctx.fillRect(cx - u * 0.2, Y + u * 0.47, u * 0.4, u * 0.06);
+      ctx.fillStyle = LAMP; ctx.fillRect(cx - u * 0.17, Y + u * 0.29, u * 0.34, u * 0.19);
+      ctx.fillStyle = LIGHT; ctx.fillRect(cx - u * 0.09, Y + u * 0.32, u * 0.18, u * 0.13);
+      ctx.beginPath(); ctx.moveTo(cx - u * 0.34, Y + u * 0.31); ctx.lineTo(cx + u * 0.34, Y + u * 0.31);
+      ctx.lineTo(cx + u * 0.12, Y + u * 0.16); ctx.lineTo(cx - u * 0.12, Y + u * 0.16); ctx.closePath();
+      ctx.fillStyle = LAMP_D; ctx.fill();
+      ell(cx, Y + u * 0.13, u * 0.06, u * 0.05, LAMP_D);
+      break;
+    }
+    case "pine": {
+      const m = v > 0.5 ? -1 : 1;
+      ell(cx, Y + u * 1.8, u * 0.72, u * 0.15, SHADOW);
+      ctx.strokeStyle = TRUNK; ctx.lineCap = "round"; ctx.lineWidth = Math.max(2, u * 0.16);
+      ctx.beginPath(); ctx.moveTo(cx + m * u * 0.05, Y + u * 1.8);
+      ctx.quadraticCurveTo(cx - m * u * 0.35, Y + u * 1.25, cx + m * u * 0.05, Y + u * 0.6); ctx.stroke();
+      ctx.lineWidth = Math.max(1.5, u * 0.08);
+      ctx.beginPath(); ctx.moveTo(cx - m * u * 0.14, Y + u * 1.2); ctx.lineTo(cx - m * u * 0.5, Y + u * 1.08);
+      ctx.moveTo(cx - m * u * 0.05, Y + u * 0.95); ctx.lineTo(cx + m * u * 0.45, Y + u * 0.86); ctx.stroke();
+      for (const [dx, dy, rx, ry] of [[-0.52, 1.06, 0.44, 0.21], [0.48, 0.86, 0.47, 0.22], [-0.04, 0.5, 0.44, 0.23], [0.06, 0.22, 0.26, 0.14]]) {
+        const px = cx + m * dx * u, py = Y + dy * u;
+        ell(px, py + u * 0.06, rx * u, ry * u, PINE_D);
+        ell(px, py, rx * u * 0.94, ry * u * 0.82, PINE);
+        ell(px - m * rx * u * 0.25, py - ry * u * 0.35, rx * u * 0.5, ry * u * 0.32, PINE_L);
+      }
+      break;
+    }
+    case "bridge": {
+      ctx.save(); ctx.translate(cx, cy); if (rot) ctx.rotate(Math.PI / 2);
+      const L = 3 * u;
+      ctx.fillStyle = "rgba(30,50,45,0.25)"; ctx.fillRect(-L / 2 + u * 0.08, -u * 0.24, L - u * 0.12, u * 0.6);
+      ctx.fillStyle = WOOD; ctx.fillRect(-L / 2 + u * 0.06, -u * 0.3, L - u * 0.12, u * 0.6);
+      ctx.fillStyle = WOOD_D;
+      for (let k = 1; k < 12; k++) ctx.fillRect(-L / 2 + u * 0.06 + k * (L - u * 0.12) / 12 - 0.5, -u * 0.3, Math.max(1, u * 0.03), u * 0.6);
+      ctx.fillStyle = RAIL;
+      ctx.fillRect(-L / 2 + u * 0.1, -u * 0.36, L - u * 0.2, u * 0.08);
+      ctx.fillRect(-L / 2 + u * 0.1, u * 0.28, L - u * 0.2, u * 0.08);
+      for (const px of [-L / 2 + u * 0.1, -u * 0.06, L / 2 - u * 0.22]) {
+        ctx.fillRect(px, -u * 0.42, u * 0.12, u * 0.18); ctx.fillRect(px, u * 0.24, u * 0.12, u * 0.18);
+      }
+      ctx.restore();
+      break;
+    }
+  }
+}
+
+function drawRuleIcon(r, X, Y, u) {
+  ctx.fillStyle = "rgb(217,210,193)"; rrect(X, Y, u, u, 4); ctx.fill();
+  ctx.save(); rrect(X, Y, u, u, 4); ctx.clip();
+  if (r.k === "place") {
+    const q = u / 2;
+    drawPiece("stone", X + q * 0.5, Y + q * 0.95, q, 0, 0.5);
+    ctx.strokeStyle = "#6b6f6a"; ctx.lineWidth = 1.5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(X + u / 2, Y + u * 0.12); ctx.lineTo(X + u / 2, Y + u * 0.4);
+    ctx.moveTo(X + u * 0.38, Y + u * 0.3); ctx.lineTo(X + u / 2, Y + u * 0.42); ctx.lineTo(X + u * 0.62, Y + u * 0.3); ctx.stroke();
+  } else if (r.k === "stones") {
+    const q = u / 3;
+    ctx.fillStyle = "rgba(90,80,60,0.18)";
+    for (let k = 1; k < 3; k++) { ctx.fillRect(X + k * q, Y, 1, u); ctx.fillRect(X, Y + k * q, u, 1); }
+    drawPiece("stone", X, Y + q * 0.1, q, 0, 0.6);
+    drawPiece("stone", X + 2 * q, Y + 2 * q - q * 0.1, q, 0, 0.3);
+  } else if (r.k === "lantern") {
+    const q = u / 2;
+    drawPiece("path", X, Y + q, q, 0, 0.5); drawPiece("path", X + q, Y + q, q, 0, 0.5);
+    drawPiece("lantern", X + q * 0.05, Y + q * 0.05, q, 0, 0.5);
+  } else {
+    const q = u / 3;
+    if (r.bridge) {
+      for (let k = 0; k < 3; k++) drawWater(X + q, Y + k * q, q, [k === 0, k === 2, 1, 1], 0.5, false);
+      drawPiece("bridge", X, Y + q, q, 0, 0.5);
+    } else {
+      const qq = u / 2;
+      drawWater(X + qq * 0.5, Y + qq * 0.5, qq, [1, 0, 1, 0], 0.3, false);
+      drawWater(X + qq * 1.5, Y + qq * 0.5, qq, [1, 0, 0, 1], 0.6, false);
+      drawWater(X + qq * 0.5, Y + qq * 1.5, qq, [0, 1, 1, 1], 0.7, false);
+    }
+  }
+  ctx.restore();
+}
+const RULE_TEXT = {
+  place: () => ["place every piece", "from the tray"],
+  stones: () => ["stones never touch,", "not even at corners"],
+  lantern: () => ["every lantern sits", "beside the path"],
+  pond: r => r.bridge ? ["water forms one pond;", "the bridge crosses it,", "both ends on land"] : ["all water forms", "one pond"],
+};
+function drawRules() {
+  const brokenOf = { place: false, stones: ev.broken.stones, lantern: ev.broken.lantern, pond: ev.broken.pond };
+  for (const r of ruleBoxes) {
+    rrect(r.x, r.y, r.w, r.h, 8); ctx.fillStyle = CARD; ctx.fill();
+    const iu = r.icon, ix = r.x + 9, iy = r.y + (r.h - iu) / 2, tx = ix + iu + 10, room = r.x + r.w - 8 - tx;
+    drawRuleIcon(r, ix, iy, iu);
+    const lines = RULE_TEXT[r.k](r);
+    let fs = r.font - (lines.length > 2 ? 1 : 0);
+    ctx.font = `${fs}px ${FONT}`;
+    const widest = Math.max(...lines.map(t => ctx.measureText(t).width));
+    if (widest > room) { fs = Math.max(10, Math.floor(fs * room / widest * 10) / 10); ctx.font = `${fs}px ${FONT}`; }
+    const lh = Math.round(fs * 1.25);
+    ctx.fillStyle = TEXT; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    const ty = r.y + r.h / 2 - (lines.length - 1) * lh / 2;
+    lines.forEach((t, k) => ctx.fillText(t, tx, ty + k * lh));
+    if (brokenOf[r.k]) {                         // a rule not yet met: a small soft dot on its picture
+      ell(ix + iu - 1, iy + 1, 5.5, 5.5, CARD); ell(ix + iu - 1, iy + 1, 4, 4, CORAL);
+    }
+  }
+}
+
+function footprintPx(p) { const [w, h] = dims(p.t, p.rot); return [gx + p.x * c, gy + p.y * c, w * c, h * c]; }
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  drawRules();
+  // the garden: a moss edge, then raked gravel
+  const G = N * c;
+  rrect(gx - 7, gy - 7, G + 14, G + 14, 6); ctx.fillStyle = MOSS; ctx.fill();
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(gcv, gx, gy, G, G);
+  const gridA = 0.13 * (state === "play" ? 1 : Math.max(0, 1 - rakeT * 3));
+  if (gridA > 0) {
+    ctx.fillStyle = `rgba(90,80,60,${gridA})`;
+    for (let k = 1; k < N; k++) { ctx.fillRect(gx + k * c, gy, 1, G); ctx.fillRect(gx, gy + k * c, G, 1); }
+  }
+  // lantern light on the gravel
+  pcs.forEach(p => {
+    if (!p.on || p.t !== "lantern") return;
+    const x = gx + (p.x + 0.5) * c, y = gy + (p.y + 0.4) * c, gr = ctx.createRadialGradient(x, y, 0, x, y, c * 0.8);
+    gr.addColorStop(0, "rgba(255,206,120,0.32)"); gr.addColorStop(1, "rgba(255,206,120,0)");
+    ctx.fillStyle = gr; ctx.fillRect(x - c, y - c, 2 * c, 2 * c);
+  });
+  // water first, then everything standing on the gravel, back to front
+  for (let cc = 0; cc < N * N; cc++) {
+    const i = ground[cc]; if (i < 0) continue;
+    const x = cc % N, y = cc / N | 0;
+    const wet = (xx, yy) => xx >= 0 && yy >= 0 && xx < N && yy < N && ground[yy * N + xx] >= 0;
+    drawWater(gx + x * c, gy + y * c, c, [!wet(x, y - 1), !wet(x, y + 1), !wet(x - 1, y), !wet(x + 1, y)], pcs[i].v, pcs[i].fixed);
+  }
+  const order = pcs.map((p, i) => i).filter(i => pcs[i].on && pcs[i].t !== "water");
+  const rank = t => t === "path" ? 0 : t === "bridge" ? 1 : 2;
+  order.sort((a, b) => rank(pcs[a].t) - rank(pcs[b].t) || (pcs[a].y + dims(pcs[a].t, pcs[a].rot)[1]) - (pcs[b].y + dims(pcs[b].t, pcs[b].rot)[1]));
+  for (const i of order) { const p = pcs[i]; drawPiece(p.t, gx + p.x * c, gy + p.y * c, c, p.rot, p.v); }
+  // pieces that break a harmony rule: a soft outline
+  if (state === "play") {
+    ctx.strokeStyle = CORAL; ctx.lineWidth = Math.max(2, c * 0.06);
+    pcs.forEach((p, i) => {
+      if (!p.on || !ev.bad[i]) return;
+      const [x, y, w, h] = footprintPx(p);
+      rrect(x + 2.5, y + 2.5, w - 5, h - 5, c * 0.18); ctx.stroke();
+    });
+  }
+  // where a dragged piece would land
+  if (drag && drag.moved) {
+    const s = snapOf(drag);
+    if (s) {
+      const p = pcs[drag.i], [w, h] = dims(p.t, p.rot);
+      ctx.fillStyle = s.ok ? "rgba(255,255,255,0.38)" : "rgba(236,138,107,0.35)";
+      rrect(gx + s.x * c + 2, gy + s.y * c + 2, w * c - 4, h * c - 4, c * 0.16); ctx.fill();
+    }
+  }
+  // the tray
+  if (state === "play") {
+    if (drag && drag.moved && !drag.fromTray && overTray(drag.x, drag.y)) {
+      rrect(trayBox.x, trayBox.y, trayBox.w, trayBox.h, 10); ctx.fillStyle = "rgba(255,255,255,0.06)"; ctx.fill();
+    }
+    for (const sl of slots) {
+      const left = pcs.filter(p => p.t === sl.t && !p.on && !p.fixed && !(drag && drag.moved && pcs[drag.i] === p)).length;
+      rrect(sl.x, sl.y, sl.w, sl.h, 8);
+      ctx.fillStyle = left ? SLOT : "rgba(47,62,55,0.45)"; ctx.fill();
+      ctx.strokeStyle = SLOT_EDGE; ctx.lineWidth = 1; ctx.stroke();
+      if (!left) continue;
+      const [w, h] = dims(sl.t, 0), u = Math.min((sl.w - 14) / w, (sl.h - 30) / h, 40);
+      drawPiece(sl.t, sl.x + (sl.w - w * u) / 2, sl.y + 6 + (sl.h - 28 - h * u) / 2, u, 0, 0.4);
+      ctx.font = `13px ui-monospace, Menlo, Consolas, monospace`; ctx.fillStyle = MUTED;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("× " + left, sl.x + sl.w / 2, sl.y + sl.h - 12);
+    }
+  }
+  // the piece in hand
+  if (drag && drag.moved) {
+    const p = pcs[drag.i], X = drag.x - drag.gox, Y = drag.y - drag.goy - drag.lift;
+    ctx.globalAlpha = 0.95;
+    drawPiece(p.t, X, Y, c, p.rot, p.v);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---------- input: drag from the tray, tap to turn, drag back to the tray to take away ----------
+const inBox = (b, x, y) => x >= b.x && y >= b.y && x <= b.x + b.w && y <= b.y + b.h;
+const overTray = (x, y) => trayBox && inBox(trayBox, x, y);
+function cellAt(x, y) {
+  const cx = Math.floor((x - gx) / c), cy = Math.floor((y - gy) / c);
+  return cx < 0 || cy < 0 || cx >= N || cy >= N ? -1 : cy * N + cx;
+}
+function snapOf(d) {
+  const p = pcs[d.i], [w, h] = dims(p.t, p.rot);
+  const fx = (d.x - d.gox - gx) / c, fy = (d.y - d.goy - d.lift - gy) / c;
+  if (fx + w / 2 < -0.2 || fy + h / 2 < -0.2 || fx + w / 2 > N + 0.2 || fy + h / 2 > N + 0.2) return null;
+  const x = Math.max(0, Math.min(N - w, Math.round(fx))), y = Math.max(0, Math.min(N - h, Math.round(fy)));
+  return { x, y, ok: fits(d.i, x, y, p.rot) };
+}
+function turn(i, cell) {
+  const p = pcs[i]; if (!KIND[p.t].turns) return;
+  const old = [p.x, p.y, p.rot], pivot = p.t === "bridge" ? cellsOf(p.t, p.x, p.y, p.rot)[1] : cell;
+  const px = pivot % N, py = pivot / N | 0, nr = 1 - p.rot, [w, h] = dims(p.t, nr);
+  lift(i);
+  const cand = [];
+  for (let y = py - h + 1; y <= py; y++) for (let x = px - w + 1; x <= px; x++)
+    cand.push([x, y, Math.hypot(x + w / 2 - px - 0.5, y + h / 2 - py - 0.5)]);
+  cand.sort((a, b) => a[2] - b[2]);
+  if (p.t === "slab") cand.unshift([old[0], old[1], 0]);   // a slab swings round its first cell when it can
+  const ok = cand.find(([x, y]) => fits(i, x, y, nr));
+  if (ok) put(i, ok[0], ok[1], nr); else put(i, old[0], old[1], old[2]);
+  changed();
+}
+cv.addEventListener("pointerdown", e => {
+  if (state !== "play" || drag) return;
+  const x = e.clientX, y = e.clientY, lift0 = e.pointerType === "mouse" ? 0 : Math.min(64, c * 0.9 + 18);
+  for (const sl of slots) if (inBox(sl, x, y)) {
+    const i = pcs.findIndex(p => p.t === sl.t && !p.on && !p.fixed);
+    if (i < 0) return;
+    pcs[i].rot = 0;
+    const [w, h] = dims(sl.t, 0);
+    drag = { i, fromTray: true, gox: w * c / 2, goy: h * c / 2, x, y, lift: lift0, moved: true, prev: null, id: e.pointerId };
+    try { cv.setPointerCapture(e.pointerId); } catch (er) {}
+    dirty = true; return;
+  }
+  const cell = cellAt(x, y); if (cell < 0) return;
+  let i = upper[cell];
+  if (i >= 0 && pcs[i].fixed) return;
+  if (i < 0) i = ground[cell];
+  if (i < 0 || pcs[i].fixed) return;
+  const p = pcs[i];
+  drag = { i, fromTray: false, gox: x - (gx + p.x * c), goy: y - (gy + p.y * c), x, y, sx: x, sy: y, lift: 0, lift0,
+    moved: false, cell, prev: [p.x, p.y, p.rot], id: e.pointerId };
+  try { cv.setPointerCapture(e.pointerId); } catch (er) {}
+});
+cv.addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (!drag.moved && Math.hypot(drag.x - drag.sx, drag.y - drag.sy) > 8) { drag.moved = true; drag.lift = drag.lift0; lift(drag.i); changed(); }
+  dirty = true;
+});
+function endDrag(cancel) {
+  const d = drag; drag = null; if (!d) return;
+  if (!d.moved) { if (!cancel) turn(d.i, d.cell); dirty = true; return; }
+  const s = cancel ? null : snapOf(d);
+  if (s && s.ok) put(d.i, s.x, s.y, pcs[d.i].rot);
+  else if ((s || cancel) && d.prev) put(d.i, d.prev[0], d.prev[1], d.prev[2]);
+  changed();
+}
+cv.addEventListener("pointerup", e => { if (drag && e.pointerId === drag.id) endDrag(false); });
+cv.addEventListener("pointercancel", e => { if (drag && e.pointerId === drag.id) endDrag(true); });
+nextBtn.addEventListener("click", () => newLevel(level % TOTAL + 1));
+
+// ---------- loop ----------
+let last = 0;
+function frame(t) {
+  const dt = Math.min(0.1, (t - last) / 1000);
+  if (t - last >= 30) {                                     // about 30 frames a second is plenty
+    last = t;
+    if (state === "raking") {
+      rakeT = Math.min(1, rakeT + dt / RAKE_SECS);
+      paintGravel(rakeT); dirty = true;
+      if (rakeT >= 1 && (endTimer += dt) > 0.7) { state = "done"; nextBtn.textContent = "next"; endBox.classList.remove("hidden"); }
+    }
+    if (dirty) { draw(); dirty = false; }
+  }
+  requestAnimationFrame(frame);
+}
+addEventListener("resize", () => { layout(); });
+
+// handles for automated testing: play the generated solution through the game's own functions
+window.garden = {
+  go: n => newLevel(n),
+  solve() {
+    pcs.forEach((p, i) => { if (!p.fixed) lift(i); });
+    solution.forEach((s, i) => { if (!s.fixed) put(i, s.x, s.y, s.rot); });
+    changed();
+  },
+  info: () => ({ level, N, state, pieces: pcs.filter(p => !p.fixed).length, fixed: pcs.filter(p => p.fixed).length,
+    types: pcs.map(p => p.t), broken: ev.broken, done: ev.done }),
+  api: { pcs: () => pcs, solution: () => solution, fits, put, lift, evaluate, cellsOf, dims, KIND, changed, layoutInfo: () => ({ gx, gy, c, slots }), N: () => N },
+};
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>

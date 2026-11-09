@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a1430">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Drifts</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="icon" href="../../icon-192.png">
+<link rel="apple-touch-icon" href="../../icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #0a1430; overflow: hidden;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; }
+  button { font: 15px/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em;
+    color: #e6eefb; background: #16264d; border: 1px solid #5f78a8; border-radius: 6px;
+    width: 104px; padding: 14px 0; cursor: pointer; }
+  button:active { background: #101c3b; }
+  button:focus-visible { outline: 2px solid #e6eefb; outline-offset: 3px; }
+  #home { position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 12px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; color: #9fb2d6; text-decoration: none;
+    padding: 6px 4px; margin: -6px -4px; }
+  #home:focus-visible { outline: 2px solid #e6eefb; outline-offset: 3px; }
+  #lvl { position: fixed; top: calc(8px + env(safe-area-inset-top)); height: 16px; line-height: 16px;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .08em; color: #b4c4e2; }
+  #speed { position: fixed; width: auto; min-width: 52px; height: 44px; padding: 0 14px; font-size: 13px; }
+  #hint { position: fixed; left: 0; right: 0; text-align: center; padding: 0 8px;
+    font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .03em; color: #e3ebf8; pointer-events: none; }
+  #end { position: fixed; left: 0; right: 0; display: flex; justify-content: center; pointer-events: none; }
+  #end button { pointer-events: auto; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<a id="home" href="../../index.html">‹ all games</a>
+<div id="lvl"></div>
+<div id="hint" class="hidden">tap to add a fence · tap to turn · drag to move</div>
+<button id="speed">1×</button>
+<div id="end" class="hidden"><button id="next">next</button></div>
+<script>
+"use strict";
+// ---------- settings ----------
+const GW = 36, GH = 64, N = GW * GH;   // the landscape grid, in cells
+const TOTAL = 200;                     // distinct levels
+const TPS = 10;                        // simulation steps per second at 1×
+const EMIT = 2;                        // each gap in the clouds lets a flake go every EMIT steps
+const MELT = 0.02;                     // chance per step that a resting, uncovered snow cell melts
+const MELT_T = Math.floor(MELT * 1073741824);
+const TOP = 4;                         // rows under the clouds where fences may not go
+const DIRS = [[1, 0], [1, 1], [0, 1], [1, -1]];   // fence angles: —  \  |  /
+const GEN_T = 700, WIN0 = 450;         // level check: steps simulated, and the window where targets must stay full
+const AIR = 0, GROUND = 1, ROCK = 2, PINE = 3, TRUNK = 4, WALL = 5, ROOF = 6, CHIMNEY = 7;
+
+// ---------- dom ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const endBox = document.getElementById("end");
+const nextBtn = document.getElementById("next");
+const speedBtn = document.getElementById("speed");
+const lvlLabel = document.getElementById("lvl");
+const hintBox = document.getElementById("hint");
+const SPEEDS = [1, 2, 3, 5];
+let speedIdx = 0;
+const calm = (() => { try { return matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; } })();
+
+// ---------- seeded random ----------
+let seed = 0;
+function rnd() { // mulberry32
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = ri(0, i); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function hash(i, t) {            // fixed noise for melting: the same cell and step always give the same answer
+  let h = Math.imul(i ^ 0x5bd1e995, 0x27d4eb2d) ^ Math.imul(t + 0x165667b1, 0x85ebca6b);
+  h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d); h ^= h >>> 12; h = Math.imul(h, 0x297a2d39); h ^= h >>> 15;
+  return h & 0x3fffffff;            // 30 bits: stays a small integer
+}
+
+// ---------- numbered levels: level n always builds the same puzzle ----------
+function seedFor(n) {            // a fixed scramble of the level number
+  let h = Math.imul((n + 1) ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
+}
+const saved = {                  // progress, kept in this browser only
+  get() { try { return parseInt(localStorage.getItem("drifts.level"), 10) || 1; } catch (e) { return 1; } },
+  set(n) { try { localStorage.setItem("drifts.level", String(n)); } catch (e) {} },
+};
+
+// ---------- difficulty: more targets, more streams and rocks, fewer spare fences; a harder level every 5th ----------
+function difficulty(n) {
+  const hard = n > 4 && n % 5 === 0;
+  const targets = Math.min(3, 1 + (n >= 6) + (n >= 30) + (hard ? 1 : 0));
+  return {
+    n, hard, targets,
+    pockets: Math.min(6, targets + 2 + (targets >= 3 ? 1 : 0)),
+    src: n < 6 ? 1 : Math.min(3, Math.max(1, targets - ri(0, 1) + (n >= 60 && rnd() < 0.3 ? 1 : 0))),
+    rocks: n < 10 ? 0 : n < 35 ? ri(0, 1) : ri(1, 2) + (hard && n >= 60 ? 1 : 0),
+    cup: n < 20 ? 0 : 0.5,
+    pines: n < 5 ? ri(0, 1) : ri(1, 3),
+    hillLo: n < 20 ? 14 : 16, hillHi: n < 20 ? 20 : 27,
+    cliff: n < 20 ? 2 : 4, clump: n < 20 ? 0.2 : 0.55,
+    pw: n < 40 ? 5 : 6,
+    spare: n <= 30 || (n <= 60 && !hard) ? 1 : 0,
+    maxF: targets + 2,
+  };
+}
+
+// ---------- landscape: a hill stepping down to both edges, hollows, a cabin, pines, rock ledges ----------
+function makeTerrain(D) {
+  const stat = new Uint8Array(N), h = new Array(GW).fill(0), used = new Uint8Array(GW);
+  const pw = ri(2, 5), pc = ri(6, GW - 7 - pw), top = ri(D.hillLo, D.hillHi);
+  for (let x = pc; x < pc + pw; x++) h[x] = top;
+  const steps = (len, drop) => {                  // drop spread over len columns, some steps grouped into cliffs
+    const d = new Array(len).fill(0);
+    let left = Math.min(drop, len * D.cliff - 1);
+    for (let guard = 0; left > 0 && guard < 5000; guard++) {
+      let k = ri(0, len - 1);
+      if (rnd() < D.clump) { const has = d.map((v, i) => i).filter(i => d[i] > 0 && d[i] < D.cliff); if (has.length) k = has[ri(0, has.length - 1)]; }
+      if (d[k] >= D.cliff) continue;
+      d[k]++; left--;
+    }
+    return d;
+  };
+  const dl = steps(pc, top - ri(3, 7)), dr = steps(GW - pc - pw, top - ri(3, 7));
+  for (let x = pc - 1; x >= 0; x--) h[x] = h[x + 1] - dl[pc - 1 - x];
+  for (let x = pc + pw; x < GW; x++) h[x] = h[x - 1] - dr[x - pc - pw];
+  for (let x = 0; x < GW; x++) h[x] = Math.max(2, h[x]);
+  h[0] = Math.min(h[0], h[1]); h[GW - 1] = Math.min(h[GW - 1], h[GW - 2]);
+
+  // the cabin first, on ground that is nearly level, away from the hilltop
+  let cabin = null;
+  for (let tries = 0; tries < 300 && !cabin; tries++) {
+    const x0 = ri(1, GW - 9);
+    if (!(x0 + 7 < pc || x0 - 1 > pc + pw - 1)) continue;
+    let lo = 99, hi = 0;
+    for (let x = x0; x <= x0 + 6; x++) { lo = Math.min(lo, h[x]); hi = Math.max(hi, h[x]); }
+    if (hi - lo > 5 || GH - hi - 12 < TOP + 10) continue;
+    for (let x = x0; x <= x0 + 6; x++) h[x] = hi;
+    for (let x = x0 - 1; x <= x0 + 7; x++) used[x] = 3;
+    cabin = { x0, yb: GH - hi };
+  }
+
+  // hollows dug into the ground; two hollows may share a rim
+  const ground = [];
+  for (let tries = 0; ground.length < D.pockets && tries < 400; tries++) {
+    const w = ri(3, D.pw), x0 = ri(1, GW - 2 - w);
+    let free = used[x0 - 1] < 2 && used[x0 + w] < 2;
+    for (let x = x0; x < x0 + w; x++) if (used[x]) free = false;
+    if (!free) continue;
+    let base = 99;
+    for (let x = x0 - 1; x <= x0 + w; x++) base = Math.min(base, h[x]);
+    const f = base - ri(2, 3);
+    if (f < 2) continue;
+    for (let x = x0; x < x0 + w; x++) { h[x] = f; used[x] = 2; }
+    used[x0 - 1] = Math.max(used[x0 - 1], 1); used[x0 + w] = Math.max(used[x0 + w], 1);
+    ground.push({ x0, w, f });
+  }
+  for (let x = 0; x < GW; x++) for (let y = GH - h[x]; y < GH; y++) stat[y * GW + x] = GROUND;
+  if (cabin) {
+    const { x0, yb } = cabin, put = (x, y, k) => { if (x >= 0 && x < GW && y >= 0) stat[y * GW + x] = k; };
+    for (let y = yb - 4; y < yb; y++) for (let x = x0; x <= x0 + 6; x++) put(x, y, WALL);
+    for (let r = 0; r < 5; r++) for (let x = x0 - 1 + r; x <= x0 + 7 - r; x++) put(x, yb - 5 - r, ROOF);
+    for (let y = yb - 10; y <= yb - 8; y++) put(x0 + 5, y, CHIMNEY);
+  }
+
+  // pines: a trunk and two tiers of branches
+  const pines = [];
+  for (let tries = 0; pines.length < D.pines && tries < 200; tries++) {
+    const x = ri(3, GW - 4), big = rnd() < 0.5, widths = big ? [7, 5, 3, 5, 3, 1] : [5, 3, 1, 3, 1];
+    const rad = (widths[0] - 1) / 2;
+    let ok = true;
+    for (let k = x - rad; k <= x + rad; k++) if (k < 0 || k >= GW || used[k]) ok = false;
+    if (!ok) continue;
+    const yb = GH - h[x], cells = [[x, yb - 1, TRUNK], [x, yb - 2, TRUNK]];
+    widths.forEach((w, r) => { for (let k = -(w - 1) / 2; k <= (w - 1) / 2; k++) cells.push([x + k, yb - 3 - r, PINE]); });
+    if (cells.some(([cx, cy]) => cy < TOP + 8 || stat[cy * GW + cx])) continue;
+    for (const [cx, cy, k] of cells) stat[cy * GW + cx] = k;
+    for (let k = x - rad; k <= x + rad; k++) used[k] = 1;
+    pines.push(x);
+  }
+
+  // rock ledges jutting from the sides, some with a cup on top
+  const cups = [], rockRows = [];
+  for (let tries = 0; rockRows.length < D.rocks && tries < 200; tries++) {
+    const left = rnd() < 0.5, len = ri(4, 8), cup = len >= 5 && rnd() < D.cup;
+    const col = k => left ? k : GW - 1 - k;
+    let lowest = 0;
+    for (let k = 0; k < len + 2; k++) lowest = Math.max(lowest, h[col(k)]);
+    const yMin = TOP + 6 + (cup ? 2 : 0), yMax = GH - lowest - 12;
+    if (yMax < yMin) continue;
+    const y = ri(yMin, yMax);
+    if (rockRows.some(r => Math.abs(r - y) < 8)) continue;
+    const cells = [];
+    for (let k = 0; k < len; k++) cells.push([col(k), y]);
+    for (let k = 0; k < len - 2; k++) cells.push([col(k), y + 1]);
+    if (cup) for (const k of [0, len - 1]) { cells.push([col(k), y - 1]); cells.push([col(k), y - 2]); }
+    if (cells.some(([cx, cy]) => stat[cy * GW + cx])) continue;
+    for (const [cx, cy] of cells) stat[cy * GW + cx] = ROCK;
+    rockRows.push(y);
+    if (cup) { const c2 = []; for (let k = 1; k < len - 1; k++) for (const yy of [y - 2, y - 1]) c2.push(yy * GW + col(k)); cups.push(c2); }
+  }
+
+  // every hollow as a list of cells, up to the lower of its two rims
+  const pockets = [];
+  for (const g of ground) {
+    const line = Math.min(h[g.x0 - 1], h[g.x0 + g.w]), cells = [];
+    for (let x = g.x0; x < g.x0 + g.w; x++) for (let y = GH - line; y < GH - g.f; y++) cells.push(y * GW + x);
+    pockets.push(cells);
+  }
+  pockets.push(...cups);
+
+  const L = { stat, h, cabin, sources: [], pockets: pockets.map(cellsToPocket), targets: [], isPocket: new Uint8Array(N), isTarget: new Uint8Array(N) };
+  for (const p of L.pockets) for (const i of p.cells) L.isPocket[i] = 1;
+  return L;
+}
+function cellsToPocket(cells) {
+  let x0 = GW, x1 = 0, top = GH;
+  for (const i of cells) { x0 = Math.min(x0, i % GW); x1 = Math.max(x1, i % GW); top = Math.min(top, (i / GW) | 0); }
+  return { cells, cx: (x0 + x1) / 2, top };
+}
+
+// ---------- the snow ----------
+function newWorld(L, live) {
+  const occ = new Uint8Array(N);       // 1 ground or rock, 2 fence, 3 snow: one array to check for open air
+  for (let i = 0; i < N; i++) if (L.stat[i]) occ[i] = 1;
+  return { snow: new Int32Array(N), occ, lo: new Int32Array(GH), hi: new Int32Array(GH), fence: new Int8Array(N).fill(-1), tick: 0, nextId: 1,
+    emitK: L.sources.map(() => 0), fences: [], flow: null,
+    offX: live ? new Int8Array(N) : null, offY: live ? new Int8Array(N) : null, ghosts: live ? [] : null };
+}
+
+// one step: flakes leave the gaps, fall, slide off slopes steeper than a diagonal, and resting uncovered snow melts now and then
+// snow cells of each row as bits (lo: columns 0 to 29, hi: 30 and up; 30 bits keep the numbers small), so a step only visits snow
+function snowOn(W, i) { const x = i % GW, y = (i / GW) | 0; if (x < 30) W.lo[y] |= 1 << x; else W.hi[y] |= 1 << (x - 30); }
+function snowOff(W, i) { const x = i % GW, y = (i / GW) | 0; if (x < 30) W.lo[y] &= ~(1 << x); else W.hi[y] &= ~(1 << (x - 30)); }
+function step(L, W) {
+  const sn = W.snow, oc = W.occ, lo = W.lo, hi = W.hi, t = W.tick++, offX = W.offX, offY = W.offY, flow = W.flow;
+  if (offX) { offX.fill(0); offY.fill(0); }
+  if (t % EMIT === 0) for (let k = 0; k < L.sources.length; k++) {
+    const s = L.sources[k], x = s.x + (W.emitK[k]++ % s.w);
+    if (!oc[x]) { sn[x] = W.nextId++; oc[x] = 3; snowOn(W, x); if (offY) offY[x] = 1; }
+  }
+  const up = t & 1;                            // visit each row left to right or right to left, in turn
+  for (let y = GH - 1; y >= 0; y--) {
+    let ml = lo[y], mh = hi[y];
+    if (!ml && !mh) continue;                  // a row of open air: nothing to do
+    const row = y * GW;
+    for (;;) {
+      let x;
+      if (up) {
+        if (ml) { x = 31 - Math.clz32(ml & -ml); ml &= ml - 1; }
+        else if (mh) { x = 61 - Math.clz32(mh & -mh); mh &= mh - 1; }
+        else break;
+      } else {
+        if (mh) { const b = 31 - Math.clz32(mh); mh ^= 1 << b; x = b + 30; }
+        else if (ml) { x = 31 - Math.clz32(ml); ml ^= 1 << x; }
+        else break;
+      }
+      const i = row + x, id = sn[i];
+      if (y === GH - 1) { sn[i] = 0; oc[i] = 0; snowOff(W, i); continue; }
+      const b = i + GW;
+      if (!oc[b]) {
+        sn[b] = id; oc[b] = 3; sn[i] = 0; oc[i] = 0; snowOff(W, i); snowOn(W, b);
+        if (offY) offY[b] = 1; if (flow) flow[b]++; continue;
+      }
+      const d0 = ((id + t) & 1) ? 1 : -1;
+      let moved = false;
+      for (let r = 0; r < 2; r++) {
+        const d = r ? -d0 : d0, nx = x + d;
+        if (nx < 0 || nx >= GW) { sn[i] = 0; oc[i] = 0; snowOff(W, i); moved = true; break; }   // off the edge of the land
+        if (!oc[i + d] && !oc[b + d]) {                                // a diagonal step needs the side cell open too
+          const sb = b + d;
+          sn[sb] = id; oc[sb] = 3; sn[i] = 0; oc[i] = 0; snowOff(W, i); snowOn(W, sb);
+          if (offX) { offX[sb] = d; offY[sb] = 1; } if (flow) flow[sb]++; moved = true; break;
+        }
+      }
+      if (moved || y === 0) continue;
+      if (!oc[i - GW] && hash(i, t) < MELT_T) { sn[i] = 0; oc[i] = 0; snowOff(W, i); if (W.ghosts) W.ghosts.push({ i, t: now }); }
+    }
+  }
+}
+
+function fenceCells(f) {
+  const [dx, dy] = DIRS[f.a], out = [];
+  for (let k = -2; k <= 2; k++) out.push([f.x + k * dx, f.y + k * dy]);
+  return out;
+}
+// a fence fits where every cell is open air under the clouds, outside the outlines and other fences
+function fenceFits(L, W, f, self, strict) {
+  for (const [x, y] of fenceCells(f)) {
+    if (x < 0 || x >= GW || y < TOP || y >= GH) return false;
+    const i = y * GW + x;
+    if (L.stat[i] || (strict ? L.isPocket[i] : L.isTarget[i])) return false;
+    if (W.fence[i] >= 0 && W.fence[i] !== self) return false;
+  }
+  return true;
+}
+function setFences(L, W, list) {
+  W.fences = list;
+  for (let i = 0; i < N; i++) if (W.fence[i] >= 0) { W.fence[i] = -1; W.occ[i] = 0; }
+  list.forEach((f, k) => {
+    if (f.lifted) return;
+    for (const [x, y] of fenceCells(f)) {
+      const i = y * GW + x;
+      if (W.snow[i]) { W.snow[i] = 0; snowOff(W, i); if (W.ghosts) W.ghosts.push({ i, t: now }); }
+      W.fence[i] = k; W.occ[i] = 2;
+    }
+  });
+}
+const pocketFill = (W, p) => { let n = 0; for (const i of p.cells) if (W.snow[i]) n++; return n / p.cells.length; };
+
+// ---------- level check: simulate, and see which hollows stay full ----------
+function simulate(L, fences, T, opt) {
+  const W = newWorld(L, false), P = L.pockets, pre = opt.pre || 0;
+  if (opt.flow) W.flow = new Uint16Array(N);
+  setFences(L, W, pre ? [] : fences);
+  const sum = new Float64Array(P.length), full = new Float64Array(P.length);
+  let samples = 0;
+  for (let t = 0; t < pre + T; t++) {
+    if (pre && t === pre) setFences(L, W, fences);
+    step(L, W);
+    const tt = t - pre;
+    if (tt >= WIN0 && tt % 10 === 0) {
+      samples++;
+      for (let k = 0; k < P.length; k++) { const f = pocketFill(W, P[k]); sum[k] += f; if (f === 1) full[k]++; }
+    }
+  }
+  for (let k = 0; k < P.length; k++) { sum[k] /= samples; full[k] /= samples; }
+  return { avg: sum, full, flow: W.flow };
+}
+const robust = (res, ks) => ks.every(k => res.full[k] >= 0.6 && res.avg[k] >= 0.95);
+
+// where snow can end up flowing, once every hollow is full: falls, slides down diagonals, spreads over flat tops
+function fenceGrid(fences) {
+  const g = new Int8Array(N).fill(-1);
+  fences.forEach((f, k) => { for (const [x, y] of fenceCells(f)) g[y * GW + x] = k; });
+  return g;
+}
+const RSOL = new Uint8Array(N), RQ = new Int32Array(N);
+function reach(L, fences) {
+  const sol = RSOL, q = RQ, seen = new Uint8Array(N);
+  if (!L.solid0) { L.solid0 = new Uint8Array(N); for (let i = 0; i < N; i++) L.solid0[i] = L.stat[i] || L.isPocket[i] ? 1 : 0; }
+  sol.set(L.solid0);
+  for (const f of fences) { const [dx, dy] = DIRS[f.a]; for (let k = -2; k <= 2; k++) sol[(f.y + k * dy) * GW + f.x + k * dx] = 1; }
+  let n = 0;
+  for (const s of L.sources) for (let x = s.x; x < s.x + s.w; x++) if (!sol[x] && !seen[x]) { seen[x] = 1; q[n++] = x; }
+  while (n) {
+    const i = q[--n], x = i % GW, b = i + GW;
+    if (b >= N) continue;
+    if (!sol[b]) { if (!seen[b]) { seen[b] = 1; q[n++] = b; } continue; }
+    let slid = false;
+    if (x === 0) slid = true;
+    else if (!sol[i - 1] && !sol[b - 1]) { slid = true; if (!seen[b - 1]) { seen[b - 1] = 1; q[n++] = b - 1; } }
+    if (x === GW - 1) slid = true;
+    else if (!sol[i + 1] && !sol[b + 1]) { slid = true; if (!seen[b + 1]) { seen[b + 1] = 1; q[n++] = b + 1; } }
+    if (!slid) {                                   // resting: the pile spreads sideways over a flat top
+      if (x > 0 && !sol[i - 1] && !seen[i - 1]) { seen[i - 1] = 1; q[n++] = i - 1; }
+      if (x < GW - 1 && !sol[i + 1] && !seen[i + 1]) { seen[i + 1] = 1; q[n++] = i + 1; }
+    }
+  }
+  return seen;
+}
+function fedBy(L, seen) {            // hollows that snow reaches from above
+  const out = [];
+  L.pockets.forEach((p, k) => { if (p.cells.some(i => i >= GW && seen[i - GW])) out.push(k); });
+  return out;
+}
+
+// a fence on the snow's path, leaning so the snow slides toward hollow P
+function pickFence(L, P, seen, fences) {
+  const W = { fence: fenceGrid(fences) }, cand = [];
+  for (let y = TOP + 2; y <= P.top - 3; y++) for (let x = 0; x < GW; x++)
+    if (seen[y * GW + x] && Math.abs(x - P.cx) <= 16) cand.push(y * GW + x);
+  if (!cand.length) return null;
+  for (let tries = 0; tries < 20; tries++) {
+    const i = cand[ri(0, cand.length - 1)], x = i % GW, y = (i / GW) | 0, r = rnd();
+    let f;
+    if (r < 0.15) f = { x: x + ri(-2, 2), y, a: 0 };
+    else if (r < 0.22) f = { x: x + (P.cx > x ? 1 : -1), y: y + ri(0, 2), a: 2 };
+    else if (P.cx > x) { const cx = x + ri(0, 2); f = { x: cx, y: y + (cx - x), a: 1 }; }
+    else { const cx = x - ri(0, 2); f = { x: cx, y: y + (x - cx), a: 3 }; }
+    if (fenceFits(L, W, f, -1, true)) return f;
+  }
+  return null;
+}
+
+// builds a known solution: fences go one at a time on the snow's path, keeping the one that fills the most hollows
+const BUDGET0 = 150;
+let budget = 0;                       // simulations left for this level (a count, so every device builds the same level)
+function sim(L, fences, T, opt) { budget--; return simulate(L, fences, T, opt); }
+function solve(L, D, unfed, nat) {
+  let fences = [], have = [];
+  const filled = res => unfed.filter(k => robust(res, [k]));
+  const sub = (a, b) => a.every(k => b.includes(k));
+  while (fences.length < D.maxF && have.length < D.targets && budget > 0) {
+    const open = unfed.filter(k => !have.includes(k));
+    if (!open.length) break;
+    const seen0 = reach(L, fences), cands = [], keys = new Set();
+    const add = fs => {
+      const key = fs.map(f => f.x + "," + f.y + "," + f.a).join(";");
+      if (keys.has(key)) return; keys.add(key);
+      const fed = fedBy(L, reach(L, fences.concat(fs))).filter(k => unfed.includes(k));
+      if (sub(have, fed) && fed.length > have.length) cands.push({ fs, gain: fed.length * 4 - fs.length });
+    };
+    for (let k = 0; k < 50; k++) { const f = pickFence(L, L.pockets[open[ri(0, open.length - 1)]], seen0, fences); if (f) add([f]); }
+    if (!cands.length && fences.length + 2 <= D.maxF)
+      for (let k = 0; k < 40; k++) {                                  // two fences in a row
+        const P = L.pockets[open[ri(0, open.length - 1)]], f1 = pickFence(L, P, seen0, fences);
+        if (!f1) continue;
+        const f2 = pickFence(L, P, reach(L, fences.concat([f1])), fences.concat([f1]));
+        if (f2) add([f1, f2]);
+      }
+    cands.sort((p, q) => q.gain - p.gain);
+    let best = null;
+    for (const cd of cands.slice(0, 6)) {
+      if (budget <= 0) break;
+      const got = filled(sim(L, fences.concat(cd.fs), GEN_T, {}));
+      if (sub(have, got) && got.length > have.length && (!best || got.length > best.got.length)) best = { fs: cd.fs, got };
+      if (best && best.got.length >= Math.min(D.targets, have.length + 1) && cd.gain < cands[0].gain) break;
+    }
+    if (!best) break;
+    fences = fences.concat(best.fs); have = best.got;
+  }
+  if (!have.length) return null;
+  const targets = shuffle(have.slice()).slice(0, D.targets);
+  for (let i = fences.length - 1; i >= 0 && fences.length > 1 && budget > 0; i--) {   // drop fences the solution does without
+    const trial = fences.filter((f, j) => j !== i);
+    if (robust(sim(L, trial, GEN_T, {}), targets)) fences = trial;
+  }
+  // a player who sets the fences late, with snow already lying around, must get there too
+  if (!robust(sim(L, fences, GEN_T, { pre: 300 }), targets)) return null;
+  return { fences, targets };
+}
+
+// gaps in the clouds, placed so that enough hollows are left for the fences to fill
+function placeSources(L, D) {
+  let best = null;
+  for (let tries = 0; tries < 6 && budget > 0; tries++) {
+    const sources = [];
+    for (let k = 0; sources.length < D.src && k < 100; k++) {
+      const x = ri(3, GW - 5), w = ri(1, 2);
+      if (!sources.some(s => Math.abs(s.x - x) < 6)) sources.push({ x, w });
+    }
+    L.sources = sources.sort((a, b) => a.x - b.x);
+    if (fedBy(L, reach(L, [])).length > L.pockets.length - D.targets) continue;   // too many hollows on the snow's way
+    const nat = sim(L, [], GEN_T, {});
+    const unfed = L.pockets.map((p, k) => k).filter(k => nat.avg[k] < 0.3 && nat.full[k] === 0);
+    if (!best || unfed.length > best.unfed.length) best = { sources, unfed, nat };
+    if (unfed.length >= D.targets + 1) break;
+  }
+  if (best) L.sources = best.sources;
+  return best;
+}
+
+function generate(n) {
+  let best = null;
+  budget = BUDGET0;
+  for (let at = 0; (at < 40 && budget > 0) || !best; at++) {
+    seed = (seedFor(n) + Math.imul(at + 1, 0x9e3779b1)) >>> 0;
+    const D = difficulty(n), L = makeTerrain(D);
+    if (L.pockets.length < 1 || !L.cabin) continue;
+    const sky = placeSources(L, D);
+    if (!sky || !sky.unfed.length) continue;
+    const sol = solve(L, D, sky.unfed, sky.nat);
+    if (!sol) continue;
+    const easyOk = n > 3 || sol.fences.length === 1;
+    const score = sol.targets.length * 10 + (easyOk ? 5 : 0) - sol.fences.length;
+    if (!best || score > best.score) best = { L, D, sol, score };
+    if (sol.targets.length >= D.targets && easyOk) break;
+  }
+  const { L, D, sol } = best;
+  L.targets = sol.targets.map(k => L.pockets[k]);
+  for (const p of L.targets) for (const i of p.cells) L.isTarget[i] = 1;
+  L.solution = sol.fences.map(f => ({ x: f.x, y: f.y, a: f.a }));
+  L.fenceCount = sol.fences.length + D.spare;
+  L.edges = L.targets.map(outline);
+  return L;
+}
+function outline(p) {                 // the border of a hollow, as cell edges
+  const inP = new Set(p.cells), segs = [];
+  for (const i of p.cells) {
+    const x = i % GW, y = (i / GW) | 0;
+    if (!inP.has(i - GW)) segs.push([x, y, x + 1, y]);
+    if (!inP.has(i + GW)) segs.push([x, y + 1, x + 1, y + 1]);
+    if (x === 0 || !inP.has(i - 1)) segs.push([x, y, x, y + 1]);
+    if (x === GW - 1 || !inP.has(i + 1)) segs.push([x + 1, y, x + 1, y + 1]);
+  }
+  return segs;
+}
+
+// ---------- level state ----------
+let level = Math.min(TOTAL, Math.max(1, saved.get()));
+let L, Wd, state = "play", endTimer = 0, now = 0, deco = null;
+
+function newLevel(n) {
+  level = n;
+  lvlLabel.textContent = n + " / " + TOTAL;
+  L = generate(n);
+  Wd = newWorld(L, true);
+  const g = Wd.ghosts; Wd.ghosts = null;
+  for (let t = 0; t < 400; t++) step(L, Wd);          // the snow has been falling for a while already
+  Wd.ghosts = g;
+  state = "play"; endTimer = 0; drag = null;
+  endBox.classList.add("hidden");
+  hintBox.classList.toggle("hidden", n !== 1);
+  makeDeco(n);
+  layout();
+}
+const targetsFull = () => L.targets.every(p => pocketFill(Wd, p) === 1);
+const supply = () => L.fenceCount - Wd.fences.length;
+
+function tick() {
+  step(L, Wd);
+  if (state === "play" && !drag && targetsFull()) { state = "won"; endTimer = 0; saved.set(level % TOTAL + 1); }
+}
+
+// ---------- layout ----------
+let W, H, dpr, c, ox, oy, barY;
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = W + "px"; cv.style.height = H + "px";
+  c = Math.max(5, Math.floor(Math.min((W - 16) / GW, (H - 40 - 66) / GH)));
+  ox = Math.floor((W - GW * c) / 2);
+  oy = 40 + Math.max(0, Math.floor((H - 106 - GH * c) / 2));
+  barY = oy + GH * c + 10;
+  const right = Math.max(12, W - (ox + GW * c));
+  lvlLabel.style.right = right + "px";
+  speedBtn.style.right = right + "px";
+  speedBtn.style.top = barY + "px";
+  endBox.style.top = (oy + 15 * c) + "px";
+  hintBox.style.top = (oy + 5 * c) + "px";
+}
+const inField = (px, py) => px >= ox && px < ox + GW * c && py >= oy && py < oy + GH * c;
+const inTray = (px, py) => py >= barY - 4 && py < barY + 50 && px >= ox - 8 && px < W - (W - (ox + GW * c)) - 70;
+const toCell = (px, py) => ({ x: Math.floor((px - ox) / c), y: Math.floor((py - oy) / c) });
+
+// ---------- decoration: stars, a moon, drifting flakes, chimney smoke ----------
+function makeDeco(n) {
+  const keep = seed; seed = seedFor(n + 77777);
+  deco = { stars: [], flakes: [], moon: { x: ri(4, GW - 5), y: ri(6, 9) } };
+  for (let k = 0; k < 46; k++) deco.stars.push({ x: rnd() * GW, y: TOP + rnd() * 26, r: rnd() < 0.25 ? 1.6 : 1, p: rnd() * 6.28 });
+  for (let k = 0; k < 34; k++) deco.flakes.push({ x: rnd() * GW, y: rnd() * GH, v: 0.5 + rnd() * 0.6, p: rnd() * 6.28 });
+  seed = keep;
+}
+
+// ---------- drawing ----------
+const COL = {
+  bg: "#0a1430", skyTop: "#10224f", skyBot: "#26457f",
+  ground: ["#5571a3", "#34497a", "#2a3c68", "#233360"],
+  rock: ["#7d8fb3", "#5a6b90", "#4b5b7f"],
+  pine: "#20605a", pineLit: "#2d7a6e", trunk: "#5e402b",
+  wall: ["#8f5d3a", "#7d4f31"], roof: "#5c3431", roofLit: "#76463f", chimney: "#6b5852",
+  window: "#ffd47c", door: "#4a2c1a",
+};
+function rrect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
+function drawStatic() {
+  const st = L.stat;
+  for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+    const i = y * GW + x, k = st[i];
+    if (!k) continue;
+    const up = y > 0 ? st[i - GW] : 0;
+    let col;
+    if (k === GROUND) {
+      let d = 0; while (d < 3 && y - d - 1 >= 0 && st[i - (d + 1) * GW] === GROUND) d++;
+      col = COL.ground[Math.min(3, d)];
+    } else if (k === ROCK) col = up === ROCK ? COL.rock[2] : y + 1 < GH && st[i + GW] === ROCK ? COL.rock[1] : COL.rock[0];
+    else if (k === PINE) col = up === PINE ? COL.pine : COL.pineLit;
+    else if (k === TRUNK) col = COL.trunk;
+    else if (k === WALL) col = COL.wall[y & 1];
+    else if (k === ROOF) col = up === ROOF || up === CHIMNEY ? COL.roof : COL.roofLit;
+    else col = COL.chimney;
+    ctx.fillStyle = col;
+    ctx.fillRect(ox + x * c, oy + y * c, c, c);
+  }
+  if (L.cabin) {                       // the lit window and the door
+    const { x0, yb } = L.cabin;
+    ctx.fillStyle = "#3a2416";
+    ctx.fillRect(ox + (x0 + 1) * c - 1, oy + (yb - 3) * c - 1, 2 * c + 2, 2 * c + 2);
+    ctx.fillStyle = COL.window;
+    ctx.fillRect(ox + (x0 + 1) * c, oy + (yb - 3) * c, 2 * c, 2 * c);
+    ctx.fillStyle = "#e7a94e";
+    ctx.fillRect(ox + (x0 + 2) * c - 1, oy + (yb - 3) * c, 2, 2 * c);
+    ctx.fillRect(ox + (x0 + 1) * c, oy + (yb - 2) * c - 1, 2 * c, 2);
+    ctx.fillStyle = COL.door;
+    ctx.fillRect(ox + (x0 + 4) * c, oy + (yb - 3) * c, Math.round(1.6 * c), 3 * c);
+  }
+}
+function drawSky(t) {
+  const g = ctx.createLinearGradient(0, oy, 0, oy + GH * c);
+  g.addColorStop(0, COL.skyTop); g.addColorStop(1, COL.skyBot);
+  ctx.fillStyle = g; ctx.fillRect(ox, oy, GW * c, GH * c);
+  for (const s of deco.stars) {
+    const a = calm ? 0.7 : 0.55 + 0.35 * Math.sin(t * 0.0006 + s.p);
+    ctx.fillStyle = `rgba(235,240,255,${a.toFixed(2)})`;
+    ctx.fillRect(ox + s.x * c, oy + s.y * c, s.r * 1.4, s.r * 1.4);
+  }
+  const m = deco.moon, mx = ox + (m.x + 0.5) * c, my = oy + (m.y + 0.5) * c;
+  const mg = ctx.createRadialGradient(mx, my, c, mx, my, c * 7);
+  mg.addColorStop(0, "rgba(240,236,214,0.22)"); mg.addColorStop(1, "rgba(240,236,214,0)");
+  ctx.fillStyle = mg; ctx.fillRect(mx - c * 7, my - c * 7, c * 14, c * 14);
+  ctx.fillStyle = "#f2edd8"; ctx.beginPath(); ctx.arc(mx, my, c * 1.9, 0, 7); ctx.fill();
+  ctx.fillStyle = "rgba(200,196,175,0.45)";
+  ctx.beginPath(); ctx.arc(mx - c * 0.6, my - c * 0.4, c * 0.45, 0, 7); ctx.arc(mx + c * 0.7, my + c * 0.5, c * 0.32, 0, 7); ctx.fill();
+  if (!calm) {                          // light snow far away, behind the hills
+    ctx.fillStyle = "rgba(225,235,255,0.28)";
+    for (const f of deco.flakes) {
+      const y = (f.y + t * 0.0012 * f.v) % GH, x = (f.x + Math.sin(t * 0.0005 + f.p) * 0.8 + GW) % GW;
+      ctx.fillRect(ox + x * c, oy + y * c, 2, 2);
+    }
+  }
+}
+function drawClouds(t) {
+  const gaps = L.sources.map(s => [s.x - 0.6, s.x + s.w + 0.6]);
+  const inGap = x => gaps.some(([a, b]) => x > a - 1.1 && x < b + 1.1);
+  for (const s of L.sources) {          // a soft glow under each gap
+    const gx = ox + (s.x + s.w / 2) * c, gy = oy + 2 * c;
+    const g = ctx.createRadialGradient(gx, gy, 0, gx, gy, c * 4);
+    g.addColorStop(0, "rgba(220,232,255,0.30)"); g.addColorStop(1, "rgba(220,232,255,0)");
+    ctx.fillStyle = g; ctx.fillRect(gx - c * 4, gy - c * 4, c * 8, c * 8);
+  }
+  for (const [layer, col, y0] of [[0, "#2e4170", 1.9], [1, "#40568a", 1.1]]) {
+    ctx.fillStyle = col;
+    for (let x = -1; x <= GW + 1; x += 1.25) {
+      if (inGap(x)) continue;
+      const r = (1.25 + 0.45 * Math.sin(x * 1.7 + layer * 2.3)) * c;
+      ctx.beginPath(); ctx.arc(ox + x * c, oy + (y0 - layer * 0.15 * Math.sin(x)) * c, r, 0, 7); ctx.fill();
+      ctx.fillRect(ox + (x - 0.7) * c, oy, 1.4 * c, y0 * c);
+    }
+  }
+}
+function drawSnow(alpha) {
+  const sn = Wd.snow, offX = Wd.offX, offY = Wd.offY;
+  const depth = new Uint8Array(GW);
+  for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+    const i = y * GW + x, id = sn[i];
+    if (!id) { depth[x] = 0; continue; }
+    const mv = offX[i] || offY[i];
+    if (mv) {
+      const back = 1 - alpha, fx = x - offX[i] * back, fy = y - offY[i] * back;
+      const wob = offX[i] ? 0 : Math.sin(id * 1.7 + fy * 0.35) * 0.24;    // flakes sway a little as they fall
+      ctx.fillStyle = (id & 3) ? "rgba(255,255,255,0.92)" : "rgba(222,236,255,0.92)";
+      ctx.beginPath(); ctx.arc(ox + (fx + 0.5 + wob) * c, oy + (fy + 0.5) * c, c * ((id & 1) ? 0.34 : 0.28), 0, 7); ctx.fill();
+      depth[x] = 0;
+      continue;
+    }
+    const d = depth[x]++;
+    const k = Math.min(1, d / 6);
+    ctx.fillStyle = `rgb(${(246 - 46 * k) | 0},${(250 - 34 * k) | 0},255)`;
+    ctx.fillRect(ox + x * c, oy + y * c, c, c);
+  }
+  for (const g of Wd.ghosts) {          // melting snow fades away
+    const a = 1 - (now - g.t) / 1400;
+    if (a <= 0) continue;
+    ctx.fillStyle = `rgba(214,228,250,${(a * 0.7).toFixed(2)})`;
+    ctx.fillRect(ox + (g.i % GW) * c, oy + ((g.i / GW) | 0) * c, c, c);
+  }
+  Wd.ghosts = Wd.ghosts.filter(g => now - g.t < 1400);
+}
+function drawTargets(over) {
+  L.targets.forEach((p, k) => {
+    const full = pocketFill(Wd, p) === 1;
+    if (!over) {
+      ctx.fillStyle = "rgba(255,206,130,0.16)";
+      for (const i of p.cells) ctx.fillRect(ox + (i % GW) * c, oy + ((i / GW) | 0) * c, c, c);
+      return;
+    }
+    ctx.strokeStyle = full ? "rgba(255,206,120,0.95)" : "rgba(255,206,130,0.85)";
+    ctx.lineWidth = full ? 2.5 : 2;
+    ctx.setLineDash(full ? [] : [Math.max(3, c * 0.5), Math.max(3, c * 0.4)]);
+    ctx.beginPath();
+    for (const [x0, y0, x1, y1] of L.edges[k]) { ctx.moveTo(ox + x0 * c, oy + y0 * c); ctx.lineTo(ox + x1 * c, oy + y1 * c); }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  });
+}
+const ANG = [0, Math.PI / 4, Math.PI / 2, -Math.PI / 4];
+function drawPlank(cx, cy, ang, len, th, lifted, faded) {
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(ang);
+  if (lifted) { ctx.fillStyle = "rgba(0,0,0,0.3)"; rrect(-len / 2 + 3, -th / 2 + 4, len, th, th * 0.3); ctx.fill(); }
+  ctx.globalAlpha = faded ? 0.45 : 1;
+  rrect(-len / 2, -th / 2, len, th, th * 0.3); ctx.fillStyle = lifted ? "#cf9a63" : "#b9814e"; ctx.fill();
+  ctx.lineWidth = 1.2; ctx.strokeStyle = "#5e3a1f"; ctx.stroke();
+  ctx.fillStyle = "rgba(255,226,180,0.35)"; ctx.fillRect(-len / 2 + th * 0.4, -th / 2 + th * 0.18, len - th * 0.8, Math.max(1, th * 0.16));
+  ctx.fillStyle = "#6e4426";
+  for (const s of [-0.32, 0.32]) { ctx.beginPath(); ctx.arc(s * len, 0, Math.max(1.2, th * 0.12), 0, 7); ctx.fill(); }
+  ctx.restore();
+}
+function drawFences() {
+  for (const f of Wd.fences) {
+    const len = (f.a % 2 ? 5 * Math.SQRT2 - 0.6 : 5) * c, faded = drag && drag.f === f && drag.overTray;
+    drawPlank(ox + (f.x + 0.5) * c, oy + (f.y + 0.5) * c, ANG[f.a], len, c * 0.9, f.lifted, faded);
+  }
+}
+function drawTray() {
+  const pw = Math.max(34, c * 3.6), th = Math.max(8, c * 0.85), cy = barY + 22;
+  for (let k = 0; k < L.fenceCount; k++) {
+    const cx = ox + 4 + pw / 2 + k * (pw + 12);
+    if (k < supply()) drawPlank(cx, cy, 0, pw, th, false, false);
+    else { rrect(cx - pw / 2, cy - th / 2, pw, th, th * 0.3); ctx.strokeStyle = "rgba(159,178,214,0.35)"; ctx.lineWidth = 1; ctx.stroke(); }
+  }
+}
+function drawGlow() {
+  if (!L.cabin) return;
+  const { x0, yb } = L.cabin, wx = ox + (x0 + 2) * c, wy = oy + (yb - 2) * c;
+  const g = ctx.createRadialGradient(wx, wy, c * 0.5, wx, wy, c * 6);
+  g.addColorStop(0, "rgba(255,196,110,0.32)"); g.addColorStop(1, "rgba(255,196,110,0)");
+  ctx.fillStyle = g; ctx.fillRect(wx - c * 6, wy - c * 6, c * 12, c * 12);
+  if (!calm) {                          // smoke from the chimney
+    const sx = ox + (x0 + 5.5) * c, sy = oy + (yb - 10) * c;
+    for (let k = 0; k < 5; k++) {
+      const p = ((now * 0.0001) + k / 5) % 1, r = c * (0.35 + p * 0.9);
+      ctx.fillStyle = `rgba(190,200,222,${(0.12 * (1 - p)).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(sx + Math.sin(p * 4 + k) * c * 0.8 + p * c * 2, sy - p * c * 9, r, 0, 7); ctx.fill();
+    }
+  }
+}
+function draw(alpha) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = COL.bg; ctx.fillRect(0, 0, W, H);
+  ctx.save(); rrect(ox, oy, GW * c, GH * c, 6); ctx.clip();
+  drawSky(now);
+  drawTargets(false);
+  drawStatic();
+  drawSnow(alpha);
+  drawGlow();
+  drawTargets(true);
+  drawFences();
+  drawClouds(now);
+  ctx.restore();
+  drawTray();
+}
+
+// ---------- input: tap air to add a fence, tap a fence to turn it, drag to move it, drag it to the tray to put it away ----------
+let drag = null;
+function hitFence(px, py) {
+  let best = -1, bd = Math.max(20, c * 1.8);
+  Wd.fences.forEach((f, k) => {
+    const [dx, dy] = DIRS[f.a];
+    const ax = ox + (f.x - 2 * dx + 0.5) * c, ay = oy + (f.y - 2 * dy + 0.5) * c, bx = ox + (f.x + 2 * dx + 0.5) * c, by = oy + (f.y + 2 * dy + 0.5) * c;
+    const vx = bx - ax, vy = by - ay, u = Math.max(0, Math.min(1, ((px - ax) * vx + (py - ay) * vy) / (vx * vx + vy * vy)));
+    const d = Math.hypot(px - ax - u * vx, py - ay - u * vy);
+    if (d < bd) { bd = d; best = k; }
+  });
+  return best;
+}
+function rotateFence(f) {
+  const k = Wd.fences.indexOf(f);
+  for (let r = 1; r < 4; r++) {
+    const nf = { x: f.x, y: f.y, a: (f.a + r) % 4 };
+    if (fenceFits(L, Wd, nf, k, false)) { f.a = nf.a; break; }
+  }
+  setFences(L, Wd, Wd.fences);
+}
+function addFenceNear(g) {
+  if (supply() <= 0) return;
+  for (let r = 0; r <= 3; r++)
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+      for (let a = 0; a < 4; a++) {
+        const f = { x: g.x + dx, y: g.y + dy, a };
+        if (fenceFits(L, Wd, f, -1, false)) { Wd.fences.push(f); setFences(L, Wd, Wd.fences); return; }
+      }
+    }
+}
+cv.addEventListener("pointerdown", e => {
+  if (state !== "play" || drag) return;
+  const px = e.clientX, py = e.clientY, fi = hitFence(px, py);
+  if (fi >= 0) { const f = Wd.fences[fi], g = toCell(px, py); drag = { kind: "fence", f, sx: px, sy: py, dx: f.x - g.x, dy: f.y - g.y }; }
+  else if (inTray(px, py) && supply() > 0) drag = { kind: "tray", f: null, sx: px, sy: py };
+  else if (inField(px, py)) drag = { kind: "tap", sx: px, sy: py };
+  else return;
+  drag.moved = false; drag.overTray = false;
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+});
+cv.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const px = e.clientX, py = e.clientY;
+  if (!drag.moved && Math.hypot(px - drag.sx, py - drag.sy) > 8) {
+    drag.moved = true;
+    if (drag.kind === "fence") { drag.f.lifted = true; setFences(L, Wd, Wd.fences); }
+  }
+  if (!drag.moved) return;
+  const g = toCell(px, py);
+  drag.overTray = inTray(px, py);
+  if (drag.kind === "fence") {
+    const nf = { x: g.x + drag.dx, y: g.y + drag.dy, a: drag.f.a };
+    if (fenceFits(L, Wd, nf, -1, false)) { drag.f.x = nf.x; drag.f.y = nf.y; }
+  } else if (drag.kind === "tray" && inField(px, py)) {
+    const nf = { x: g.x, y: g.y - 2, a: 0 };
+    if (fenceFits(L, Wd, nf, -1, false)) {
+      if (!drag.f) { drag.f = { x: nf.x, y: nf.y, a: 0, lifted: true }; Wd.fences.push(drag.f); }
+      else { drag.f.x = nf.x; drag.f.y = nf.y; }
+    }
+  }
+});
+function endDrag(e, cancel) {
+  if (!drag) return;
+  const d = drag; drag = null;
+  if (d.kind === "fence" || d.kind === "tray") {
+    if (d.kind === "fence" && !d.moved && !cancel) { rotateFence(d.f); return; }
+    if (d.f) {
+      if (d.overTray && !cancel) Wd.fences.splice(Wd.fences.indexOf(d.f), 1);
+      else d.f.lifted = false;
+      setFences(L, Wd, Wd.fences);
+    }
+  } else if (d.kind === "tap" && !d.moved && !cancel) addFenceNear(toCell(d.sx, d.sy));
+}
+cv.addEventListener("pointerup", e => endDrag(e, false));
+cv.addEventListener("pointercancel", e => endDrag(e, true));
+nextBtn.addEventListener("click", () => newLevel(level % TOTAL + 1));
+speedBtn.addEventListener("click", () => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  speedBtn.textContent = SPEEDS[speedIdx] + "×";
+});
+addEventListener("resize", layout);
+
+// ---------- loop ----------
+let last = 0, acc = 0;
+function frame(t) {
+  if (t - last >= 30) {                                     // about 30 frames a second is plenty
+    const dt = Math.min(0.1, (t - last) / 1000);
+    last = t; now = t;
+    acc += dt * TPS * SPEEDS[speedIdx];                     // faster = more steps per second, same rules
+    for (let n = 0; acc >= 1 && n < 20; n++) { tick(); acc -= 1; }
+    acc = Math.min(acc, 1);
+    if (state === "won" && endBox.classList.contains("hidden") && (endTimer += dt) > 1) endBox.classList.remove("hidden");
+    draw(acc);
+  }
+  requestAnimationFrame(frame);
+}
+
+newLevel(level);
+requestAnimationFrame(t => { last = t; now = t; frame(t); });
+
+try { if ("serviceWorker" in navigator) navigator.serviceWorker.register("../../sw.js").catch(() => {}); } catch (e) {}
+</script>
+</body>
+</html>
