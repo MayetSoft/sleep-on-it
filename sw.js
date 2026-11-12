@@ -1,5 +1,5 @@
 // Offline cache for the whole suite. Bump CACHE whenever any file changes.
-const CACHE = "sleep-on-it-v3";
+const CACHE = "sleep-on-it-v4";
 const FILES = [
   "./",
   "index.html",

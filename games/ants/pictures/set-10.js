@@ -161,7 +161,7 @@ PICTURES.push(
     P.on("yellow", "orange", (x, y) => { const v = -(x - 16) * Math.sin(a) + (y - 16) * Math.cos(a); return Math.abs(v - 3) < 1 || Math.abs(v + 3.5) < 0.9; });
     P.when("lilac", ring(true));
   }, 32) },
-  { tier: 1, name: "friendly ghost", make: () => picture(["purple", "lilac", "white", "ink", "pink", "yellow"], P => {
+  { tier: 1, name: "little ghost", make: () => picture(["purple", "lilac", "white", "ink", "pink", "yellow"], P => {
     P.all("purple");
     S10.plus(P, "yellow", [[4, 4], [27, 5], [28, 17], [3, 15], [11, 2]]);
     P.ell("lilac", 5, 36, 13, 7); P.ell("lilac", 28, 37, 13, 7.5);
